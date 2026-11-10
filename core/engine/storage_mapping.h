@@ -26,4 +26,9 @@ std::shared_ptr<arrow::Schema> MakeArrowSchema(const SchemaSpec& schema);
 // satisfy the schema; a mismatch is an internal error, not a cast.
 Result<std::shared_ptr<arrow::RecordBatch>> MakeRecordBatch(const SchemaSpec& schema, const std::vector<Row>& rows);
 
+// Upper bound of arrow::util::TotalBufferSize(*MakeRecordBatch(schema, rows))
+// computed without building the batch: every column is counted with a
+// validity bitmap. Equal when every column contains a NULL.
+int64_t EstimateRecordBatchBytes(const SchemaSpec& schema, const std::vector<Row>& rows);
+
 } // namespace glamdb::detail

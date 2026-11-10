@@ -13,6 +13,7 @@
 #include <string_view>
 
 namespace NGlamDB::NIO {
+struct ILocalFS;
 class TStoreDirs;
 } // namespace NGlamDB::NIO
 
@@ -31,6 +32,9 @@ struct TLocalStorageOptions
     NGlamDB::NStorage::TStorageLimits Storage{};
     NGlamDB::NStorage::TDataWriterLimits Writer{};
     NGlamDB::NStorage::TFileIOLimits FileIO{};
+    // Filesystem adapter; empty selects the POSIX implementation. Tests inject
+    // faults here.
+    std::shared_ptr<NGlamDB::NIO::ILocalFS> Fs{};
 };
 
 // Production bridge from the coordinator seam to the durable storage
@@ -92,9 +96,11 @@ private:
         std::shared_ptr<NGlamDB::NStorage::TDurableLocalFileIO> fileIO);
 
     void CheckStore(const StoreInfo& store) const;
+    // The caller holds Mutex_. Usage and cached bases are authoritative only
+    // after VerifyRetained; InvalidateCache revokes them.
+    void RequireVerified() const;
     NGlamDB::NStorage::TStorageUsage ComputeStoreUsage();
     std::shared_ptr<const NGlamDB::NStorage::TBaseState> ResolveBase(const BaseIdentity& base);
-    std::shared_ptr<const NGlamDB::NStorage::TBaseState> ResolveVerified(const BaseIdentity& base);
     std::shared_ptr<const NGlamDB::NStorage::TBaseState> VerifyCollection(const BaseIdentity& base) const;
 };
 

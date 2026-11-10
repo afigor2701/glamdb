@@ -513,5 +513,34 @@ TEST(EngineBootstrap, NoProducerFailsClosedAndIdentityIsExplicit)
     EXPECT_FALSE(CreateStore({test::store_id, root.string()}));
 }
 
+// Without a storage reader (FakeStorage) or without the scanner build, a scan
+// fails as a dependency error and leaves readiness open.
+TEST_F(CoordinatorTest, ScanWithoutStorageReaderIsDependencyUnavailable)
+{
+    const auto scan = engine->Scan({.collection_id = test::collection_id});
+    ASSERT_FALSE(scan);
+    EXPECT_EQ(scan.error().code, "DEPENDENCY_UNAVAILABLE");
+    EXPECT_TRUE(engine->ListCollections());
+}
+
+#if !GLAMDB_TEST_STORAGE
+// GLAMDB_BUILD_STORAGE=OFF: the public factories install no backend.
+TEST(EngineBootstrap, PublicFactoriesWithoutStorageFailClosed)
+{
+    test::TempDir temporary;
+    const auto root = temporary.path / "store";
+    const auto created = CreateStore({test::store_id, root.string()});
+    ASSERT_TRUE(created) << created.error().message;
+    const auto collection =
+        (*created)->CreateCollection({test::collection_id, "events", SchemaSpec{{{"n", FieldType::Int64, true}}}});
+    EXPECT_EQ(collection.disposition, CommitDisposition::DefinitelyNotCommitted);
+    EXPECT_EQ(test::Present(collection.error).code, "DEPENDENCY_UNAVAILABLE");
+    const auto scan = (*created)->Scan({.collection_id = test::collection_id});
+    ASSERT_FALSE(scan);
+    EXPECT_EQ(scan.error().code, "COLLECTION_NOT_FOUND");
+    EXPECT_TRUE((*created)->Shutdown(std::chrono::milliseconds(1000)));
+}
+#endif
+
 } // namespace
 } // namespace glamdb

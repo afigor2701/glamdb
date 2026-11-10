@@ -2,9 +2,12 @@
 
 #include "core/api/binary.h"
 #include "core/api/canonical.h"
+#include "core/backend/storage_errors.h"
 #include "core/engine/storage_mapping.h"
 #include "core/scan/predicate.h"
 #include "core/scan/scan_planner.h"
+#include "core/storage/format_verifier.h"
+#include "core/storage/table_profile.h"
 
 #include <arrow/api.h>
 #include <arrow/io/memory.h>
@@ -15,6 +18,8 @@
 #include <parquet/schema.h>
 
 #include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <mutex>
 #include <numeric>
 #include <span>
@@ -52,21 +57,146 @@ T TakeArrow(arrow::Result<T> result, std::string_view code, std::string_view con
     return std::move(result).ValueUnsafe();
 }
 
-bool IsCorruptionKind(iceberg::ErrorKind kind)
-{
-    return kind == iceberg::ErrorKind::kNotFound || kind == iceberg::ErrorKind::kInvalid ||
-        kind == iceberg::ErrorKind::kValidationFailed || kind == iceberg::ErrorKind::kDecompressError ||
-        kind == iceberg::ErrorKind::kUnknownError;
-}
-
+// Every path a cursor reads comes from committed metadata.
 template <class T>
 T TakeIceberg(iceberg::Result<T> result, std::string_view code, std::string_view context)
 {
     if (!result) {
-        const auto effective = IsCorruptionKind(result.error().kind) ? "CORRUPTION" : code;
-        Fail(effective, context, result.error().message);
+        throw Failure(StorageError(result.error(), EStoragePath::Read, context, code));
     }
     return std::move(*result);
+}
+
+// Read-only iceberg::InputFile over bytes already read once, so the footer
+// check and decoding observe exactly the same file content.
+class TBufferInputStream final : public iceberg::SeekableInputStream
+{
+public:
+    explicit TBufferInputStream(std::string_view bytes)
+        : Bytes_(bytes)
+    { }
+
+    iceberg::Result<int64_t> Position() const override
+    {
+        return Position_;
+    }
+
+    iceberg::Status Seek(int64_t position) override
+    {
+        if (position < 0 || position > static_cast<int64_t>(Bytes_.size())) {
+            return iceberg::InvalidArgument("seek outside the buffered file");
+        }
+        Position_ = position;
+        return {};
+    }
+
+    iceberg::Result<int64_t> Read(std::span<std::byte> out) override
+    {
+        const auto count = std::min(static_cast<int64_t>(out.size()), static_cast<int64_t>(Bytes_.size()) - Position_);
+        std::memcpy(out.data(), Bytes_.data() + Position_, static_cast<size_t>(count));
+        Position_ += count;
+        return count;
+    }
+
+    iceberg::Status ReadFully(int64_t position, std::span<std::byte> out) override
+    {
+        if (position < 0 || static_cast<uint64_t>(position) > Bytes_.size() ||
+            out.size() > Bytes_.size() - static_cast<size_t>(position))
+        {
+            return iceberg::Invalid("CORRUPTION: read outside the buffered file");
+        }
+        std::memcpy(out.data(), Bytes_.data() + position, out.size());
+        return {};
+    }
+
+    iceberg::Status Close() override
+    {
+        return {};
+    }
+
+private:
+    const std::string_view Bytes_;
+    int64_t Position_ = 0;
+};
+
+class TBufferInputFile final : public iceberg::InputFile
+{
+public:
+    TBufferInputFile(std::string_view location, std::string_view bytes)
+        : Location_(location)
+        , Bytes_(bytes)
+    { }
+
+    std::string_view location() const override
+    {
+        return Location_;
+    }
+
+    iceberg::Result<int64_t> Size() const override
+    {
+        return static_cast<int64_t>(Bytes_.size());
+    }
+
+    iceberg::Result<std::unique_ptr<iceberg::SeekableInputStream>> Open() override
+    {
+        return std::make_unique<TBufferInputStream>(Bytes_);
+    }
+
+private:
+    const std::string_view Location_;
+    const std::string_view Bytes_;
+};
+
+// Limits of the canonical input (see core/api/canonical.cpp); stored values
+// outside them cannot have been written by this engine.
+constexpr size_t MaxKeyBytes = 1024;
+constexpr size_t MaxStringBytes = 1U << 20;
+constexpr int64_t MinTimestampUs = -62135596800000000LL;
+constexpr int64_t MaxTimestampUs = 253402300799999999LL;
+
+// Decoded values of one column must satisfy the canonical input domain.
+void ValidateColumn(const FieldSpec& field, const arrow::Array& array)
+{
+    // Checks offsets and, for utf8, that every value is valid UTF-8; the
+    // Parquet reader decodes strings without validation.
+    CheckArrow(array.ValidateFull(), "CORRUPTION", "validate decoded column");
+    if (!field.nullable && array.null_count() != 0) {
+        Fail("CORRUPTION", "read Parquet batch", "required column contains NULL");
+    }
+    switch (field.type) {
+        case FieldType::String: {
+            const auto& strings = static_cast<const arrow::StringArray&>(array);
+            const auto limit = field.name == "key" ? MaxKeyBytes : MaxStringBytes;
+            for (int64_t row = 0; row < strings.length(); ++row) {
+                if (!strings.IsNull(row) && strings.GetView(row).size() > limit) {
+                    Fail("CORRUPTION", "read Parquet batch", "string value exceeds its byte limit");
+                }
+            }
+            break;
+        }
+        case FieldType::Float64: {
+            const auto& doubles = static_cast<const arrow::DoubleArray&>(array);
+            for (int64_t row = 0; row < doubles.length(); ++row) {
+                const auto value = doubles.IsNull(row) ? 0.0 : doubles.Value(row);
+                if (!std::isfinite(value) || (value == 0.0 && std::signbit(value))) {
+                    Fail("CORRUPTION", "read Parquet batch", "stored float is not canonical");
+                }
+            }
+            break;
+        }
+        case FieldType::TimestampUsUtc: {
+            const auto& times = static_cast<const arrow::TimestampArray&>(array);
+            for (int64_t row = 0; row < times.length(); ++row) {
+                if (!times.IsNull(row) && (times.Value(row) < MinTimestampUs || times.Value(row) > MaxTimestampUs)) {
+                    Fail("CORRUPTION", "read Parquet batch", "stored timestamp is outside the supported UTC range");
+                }
+            }
+            break;
+        }
+        case FieldType::Bool:
+        case FieldType::Int64:
+            break;
+    }
 }
 
 template <class TFunction>
@@ -154,6 +284,7 @@ class TScanCursor final : public ScanCursor
 {
 public:
     TScanCursor(TScanContext context,
+        std::shared_ptr<iceberg::Schema> fileSchema,
         std::shared_ptr<arrow::Schema> outputSchema,
         TScanPlan plan,
         TBoundPredicate predicate,
@@ -162,6 +293,7 @@ public:
         int64_t batchRows,
         std::optional<int64_t> limit)
         : Context_(std::move(context))
+        , FileSchema_(std::move(fileSchema))
         , OutputSchema_(std::move(outputSchema))
         , Info_{OutputSchema_,
               Context_.Base,
@@ -210,6 +342,8 @@ public:
 
 private:
     const TScanContext Context_;
+    // The canonical Iceberg schema of every data file of this collection.
+    const std::shared_ptr<iceberg::Schema> FileSchema_;
     const std::shared_ptr<arrow::Schema> OutputSchema_;
     const ScanInfo Info_;
     const TScanPlan Plan_;
@@ -283,16 +417,18 @@ private:
         if (static_cast<int64_t>(bytes.size()) != file.SizeBytes) {
             Fail("CORRUPTION", "read data file", "file length differs from its manifest");
         }
+        // The same strict footer check as recovery: field IDs, names,
+        // repetition, physical/logical types and row counts per row group.
+        TBufferInputFile buffered(file.Path, bytes);
+        (void)TakeIceberg(NGlamDB::NStorage::CheckParquet(buffered, *FileSchema_, {file.SizeBytes, file.RecordCount}),
+            "CORRUPTION",
+            "verify Parquet file");
         DecodeParquet("open Parquet file", [&] {
             auto source = std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(std::move(bytes)));
             auto reader = TakeArrow(parquet::arrow::OpenFile(source, arrow::default_memory_pool()),
                 "CORRUPTION",
                 "open Parquet file");
             reader->set_batch_size(BatchRows_);
-            CheckFileSchema(*reader->parquet_reader()->metadata()->schema());
-            if (reader->parquet_reader()->metadata()->num_rows() != file.RecordCount) {
-                Fail("CORRUPTION", "open Parquet file", "row count differs from its manifest");
-            }
             std::vector<int> rowGroups(static_cast<size_t>(reader->num_row_groups()));
             std::iota(rowGroups.begin(), rowGroups.end(), 0);
             std::vector<int> columns;
@@ -304,22 +440,6 @@ private:
                 TakeArrow(reader->GetRecordBatchReader(rowGroups, columns), "CORRUPTION", "open Parquet batches");
             FileReader_ = std::move(reader);
         });
-    }
-
-    // The flat fixed schema maps field i to leaf column i with field ID i + 1.
-    void CheckFileSchema(const parquet::SchemaDescriptor& schema) const
-    {
-        const auto& fields = Context_.Collection.schema.fields;
-        if (schema.num_columns() != static_cast<int>(fields.size())) {
-            Fail("CORRUPTION", "open Parquet file", "column count differs from the collection schema");
-        }
-        for (int index = 0; index < schema.num_columns(); ++index) {
-            const auto* column = schema.Column(index);
-            const auto fieldID = column->schema_node()->field_id();
-            if (column->name() != fields[static_cast<size_t>(index)].name || (fieldID >= 0 && fieldID != index + 1)) {
-                Fail("CORRUPTION", "open Parquet file", "column identity differs from the collection schema");
-            }
-        }
     }
 
     std::shared_ptr<arrow::Array> Column(const arrow::RecordBatch& batch, size_t field) const
@@ -348,6 +468,10 @@ private:
     // Filters, projects and applies the limit. Returns nullptr for no rows.
     std::shared_ptr<arrow::RecordBatch> Produce(const arrow::RecordBatch& batch)
     {
+        // Validate every decoded column before any value can be returned.
+        for (const auto field : ReadFields_) {
+            ValidateColumn(Context_.Collection.schema.fields[field], *Column(batch, field));
+        }
         std::optional<std::vector<int64_t>> selected;
         if (Predicate_.Kind == Predicate::Kind::Compare) {
             auto rows = Take(SelectRows(Predicate_, *Column(batch, Predicate_.FieldIndex)));
@@ -406,8 +530,15 @@ Result<std::shared_ptr<ScanCursor>> OpenScan(TScanContext context, const ScanReq
         for (const auto field : outputFields) {
             fields.push_back(fullSchema->field(static_cast<int>(field)));
         }
+        auto profile = NGlamDB::NStorage::MakeTableProfile(ToStorageSchema(schema));
+        if (!profile) {
+            throw Failure({"CORRUPTION",
+                BoundedDiagnostic("collection schema profile: " + profile.error().message),
+                RetryHint::OperatorAction});
+        }
         auto plan = Take(PlanScan(context.FileIO, context.Base, request.selector));
         return std::make_shared<TScanCursor>(std::move(context),
+            std::move(profile->Schema),
             arrow::schema(std::move(fields)),
             std::move(plan),
             std::move(predicate),

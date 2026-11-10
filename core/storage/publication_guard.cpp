@@ -52,7 +52,7 @@ iceberg::Status TStoragePublicationGuard::CheckContext(const TPointerChange& cha
         return iceberg::IOError("Publication attempt has failed.");
     }
     if (const auto error = Context_.Directories->CheckIdentity()) {
-        return iceberg::IOError("Store root identity changed: {}.", error.message());
+        return iceberg::Invalid("CORRUPTION: Store root identity changed: {}.", error.message());
     }
     return {};
 }
@@ -66,9 +66,12 @@ iceberg::Status TStoragePublicationGuard::CheckCandidate(const TPointerChange& c
     const auto& entry = record.Value();
     const auto& receipt = entry.Receipt;
     if (!receipt || entry.Kind != NIO::EFileKind::Metadata || entry.State != NIO::EFileState::DirSynced ||
-        entry.FirstError || receipt->AttemptId != Context_.Attempt->Id() || entry.Length > Context_.Limits.RootBytes)
+        entry.FirstError || receipt->AttemptId != Context_.Attempt->Id())
     {
         return iceberg::ValidationFailed("Candidate metadata has no durable receipt.");
+    }
+    if (entry.Length > Context_.Limits.RootBytes) {
+        return iceberg::ValidationFailed("CAPACITY: Candidate metadata exceeds its byte limit.");
     }
     ICEBERG_ASSIGN_OR_RAISE(auto input,
         Context_.FileIO->NewInputFile(change.NewLocation, static_cast<std::int64_t>(record.Value().Length)));
@@ -97,7 +100,7 @@ iceberg::Status TStoragePublicationGuard::CheckCandidate(const TPointerChange& c
     candidate.Usage.Snapshots = candidate.Metadata->snapshots.size();
     candidate.Usage.SnapshotLogEntries = candidate.Metadata->snapshot_log.size();
     if (candidate.Metadata->metadata_log.size() > Context_.Limits.MetadataLogEntries) {
-        return iceberg::ValidationFailed("Metadata history exceeds storage capacity.");
+        return iceberg::ValidationFailed("CAPACITY: Metadata history exceeds storage capacity.");
     }
     if (Context_.Base) {
         ICEBERG_ASSIGN_OR_RAISE(candidate,
@@ -110,7 +113,7 @@ iceberg::Status TStoragePublicationGuard::CheckCandidate(const TPointerChange& c
     const auto total = ReplaceUsage(Context_.StoreUsage,
         {.Previous = Context_.Base ? Context_.Base->Usage : TStorageUsage{}, .Next = candidate.Usage});
     if (!total || CheckStorageCapacity(total.Value(), Context_.Limits)) {
-        return iceberg::ValidationFailed("Candidate exceeds store capacity.");
+        return iceberg::ValidationFailed("CAPACITY: Candidate exceeds store capacity.");
     }
     if (const auto error = Context_.Attempt->MarkFormatVerified(change.NewLocation)) {
         return iceberg::IOError("Cannot verify candidate metadata: {}.", error.message());

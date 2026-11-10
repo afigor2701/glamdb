@@ -248,11 +248,11 @@ iceberg::Result<TBaseState> CheckAppendClosureImpl(const std::shared_ptr<iceberg
             listBytes > limits.CommitBytes - delta.ManifestBytes ||
             candidate.Usage.RootBytes > limits.CommitBytes - delta.ManifestBytes - listBytes)
         {
-            return iceberg::ValidationFailed("Append exceeds file or accumulator limits.");
+            return iceberg::ValidationFailed("CAPACITY: Append exceeds file or accumulator limits.");
         }
         const auto usage = ReplaceUsage(candidate.Usage, {.Next = delta});
         if (!usage || CheckStorageCapacity(usage.Value(), limits)) {
-            return iceberg::ValidationFailed("Append exceeds storage capacity.");
+            return iceberg::ValidationFailed("CAPACITY: Append exceeds storage capacity.");
         }
         candidate.Usage = usage.Value();
         candidate.CurrentManifests = std::move(manifests);

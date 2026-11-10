@@ -1,6 +1,7 @@
 #include "core/engine/storage_mapping.h"
 
 #include <arrow/api.h>
+#include <arrow/util/byte_size.h>
 #include <gtest/gtest.h>
 
 namespace glamdb::detail {
@@ -78,6 +79,37 @@ TEST(StorageMapping, RejectsCellsThatDoNotMatchTheSchema)
     const auto empty = MakeRecordBatch(schema, {});
     ASSERT_TRUE(empty);
     EXPECT_EQ((*empty)->num_rows(), 0);
+}
+
+// The writer preflight uses the estimate instead of building a batch; it must
+// never be below the buffers WriteDataFile later receives.
+TEST(StorageMapping, RecordBatchByteEstimateBoundsArrowBuffers)
+{
+    const auto check = [](const std::vector<Row>& rows) {
+        const auto batch = MakeRecordBatch(AllTypes, rows);
+        ASSERT_TRUE(batch) << batch.error().message;
+        const auto actual = arrow::util::TotalBufferSize(**batch);
+        const auto estimate = EstimateRecordBatchBytes(AllTypes, rows);
+        EXPECT_GE(estimate, actual);
+        // Only absent validity bitmaps may separate them.
+        const auto bitmap = (static_cast<int64_t>(rows.size()) + 7) / 8;
+        EXPECT_LE(estimate - actual, static_cast<int64_t>(AllTypes.fields.size()) * bitmap);
+    };
+    const Row full{std::string("k"), true, int64_t{1}, 1.5, TimestampUs{1}};
+    const Row nulls{std::string(""), std::monostate{}, std::monostate{}, std::monostate{}, std::monostate{}};
+    check({full});
+    check({nulls});
+    check({full, nulls, full});
+    check({Row{std::string(1U << 20, 'x'), false, int64_t{-1}, -2.0, TimestampUs{-5}}});
+    std::vector<Row> many;
+    for (int index = 0; index < 10000; ++index) {
+        many.push_back(index % 3 == 0
+                ? nulls
+                : Row{std::string(index % 17, 'a'), index % 2 == 0, int64_t{index}, 0.5 * index, TimestampUs{index}});
+    }
+    check(many);
+    std::vector<Row> dense(10000, full);
+    check(dense);
 }
 
 } // namespace

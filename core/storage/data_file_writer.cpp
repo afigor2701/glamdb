@@ -186,7 +186,7 @@ iceberg::Status WriteBatches(iceberg::Writer& writer,
         }
         ICEBERG_ASSIGN_OR_RAISE(auto length, writer.length());
         if (length < 0 || length > maxFileBytes) {
-            return iceberg::InvalidArgument("Parquet file exceeds its byte limit.");
+            return iceberg::InvalidArgument("CAPACITY: Parquet file exceeds its byte limit.");
         }
     }
     return {};
@@ -269,10 +269,11 @@ iceberg::Result<TDataWriteResult> WriteDataFile(std::shared_ptr<iceberg::FileIO>
         }
         ICEBERG_RETURN_UNEXPECTED(closed);
         const auto record = attempt->Record(path);
-        if (!record || !record.Value().Receipt ||
-            record.Value().Receipt->Length > static_cast<std::uint64_t>(limits.MaxFileBytes))
-        {
-            return iceberg::Invalid("Parquet file has no valid durable receipt or exceeds its byte limit.");
+        if (!record || !record.Value().Receipt) {
+            return iceberg::Invalid("Parquet file has no valid durable receipt.");
+        }
+        if (record.Value().Receipt->Length > static_cast<std::uint64_t>(limits.MaxFileBytes)) {
+            return iceberg::InvalidArgument("CAPACITY: Parquet file exceeds its byte limit.");
         }
         const auto& receipt = *record.Value().Receipt;
         ICEBERG_ASSIGN_OR_RAISE(auto dataFile, MakeDataFile(*writer, metadata, path, shape, receipt));

@@ -34,14 +34,21 @@ if(NOT GLAMDB_IO_ONLY)
     target_link_libraries(glamdb_unit PRIVATE glamdb::core GTest::gtest_main glamdb_build_options
         SQLite::SQLite3 iceberg::iceberg_sql_catalog_static Arrow::arrow_static glamdb_json)
     target_include_directories(glamdb_unit PRIVATE "${PROJECT_SOURCE_DIR}")
+    target_compile_definitions(glamdb_unit PRIVATE "GLAMDB_TEST_STORAGE=$<BOOL:${GLAMDB_BUILD_STORAGE}>")
     gtest_discover_tests(glamdb_unit TEST_PREFIX glamdb.unit. PROPERTIES LABELS unit TIMEOUT 30)
 
     if(GLAMDB_BUILD_STORAGE)
-        target_compile_definitions(glamdb_unit PRIVATE GLAMDB_HAS_STORAGE=1)
-        target_link_libraries(glamdb_unit PRIVATE glamdb_storage)
+        # Planner, cursor and storage error classification over an in-memory
+        # FileIO: real encodings in RAM, no filesystem access (label mock).
+        file(GLOB_RECURSE mock_test_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/mock/*.cpp")
+        add_executable(glamdb_mock ${mock_test_sources})
+        target_include_directories(glamdb_mock PRIVATE "${PROJECT_SOURCE_DIR}")
+        target_link_libraries(glamdb_mock PRIVATE glamdb::core glamdb_storage glamdb_build_options GTest::gtest_main)
+        gtest_discover_tests(glamdb_mock TEST_PREFIX glamdb.mock. PROPERTIES LABELS "mock;scan" TIMEOUT 30)
+
         # Public API with the real storage backend: Parquet, Iceberg metadata and SQLite.
         file(GLOB_RECURSE vertical_test_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/vertical/*.cpp")
-        add_executable(glamdb_vertical ${vertical_test_sources})
+        add_executable(glamdb_vertical ${vertical_test_sources} support/fault_fs.cpp)
         target_include_directories(glamdb_vertical PRIVATE "${PROJECT_SOURCE_DIR}")
         target_link_libraries(glamdb_vertical PRIVATE glamdb::core glamdb_storage glamdb_build_options
             GTest::gtest_main)
@@ -80,9 +87,15 @@ if(NOT GLAMDB_IO_ONLY)
         add_test(NAME glamdb.durable_storage_catalog COMMAND "${Python3_EXECUTABLE}"
             "${CMAKE_CURRENT_SOURCE_DIR}/integration/sqlcatalog_test.py" "$<TARGET_FILE:glamdb_storage_catalog_driver>")
         set_tests_properties(glamdb.durable_storage_catalog PROPERTIES LABELS integration TIMEOUT 90)
+        add_executable(glamdb_scan_driver integration/scan_driver.cpp)
+        target_include_directories(glamdb_scan_driver PRIVATE "${PROJECT_SOURCE_DIR}")
+        target_link_libraries(glamdb_scan_driver PRIVATE glamdb::core glamdb_storage glamdb_build_options)
+        add_test(NAME glamdb.scan_process COMMAND "${Python3_EXECUTABLE}"
+            "${CMAKE_CURRENT_SOURCE_DIR}/integration/scan_process_test.py" "$<TARGET_FILE:glamdb_scan_driver>")
+        set_tests_properties(glamdb.scan_process PROPERTIES LABELS "integration;scan" TIMEOUT 120)
     endif()
     add_executable(glamdb_public_consumer_compile installed_consumer/main.cpp)
-    target_link_libraries(glamdb_public_consumer_compile PRIVATE glamdb::core glamdb_build_options)
+    target_link_libraries(glamdb_public_consumer_compile PRIVATE glamdb::core glamdb_build_options Arrow::arrow_static)
     if(NOT GLAMDB_ENABLE_ASAN AND NOT GLAMDB_ENABLE_UBSAN)
         add_test(NAME glamdb.installed_consumer COMMAND "${CMAKE_COMMAND}"
             "-DENGINE_BINARY_DIR=${PROJECT_BINARY_DIR}"

@@ -2,6 +2,7 @@
 
 #include "core/api/binary.h"
 #include "core/api/canonical.h"
+#include "core/backend/storage_errors.h"
 #include "core/storage/capacity.h"
 #include "core/storage/format_registry.h"
 #include "core/storage/format_verifier.h"
@@ -18,21 +19,13 @@
 namespace glamdb::detail {
 namespace {
 
-bool IsCorruptionKind(iceberg::ErrorKind kind)
-{
-    return kind == iceberg::ErrorKind::kNotFound || kind == iceberg::ErrorKind::kInvalid ||
-        kind == iceberg::ErrorKind::kValidationFailed || kind == iceberg::ErrorKind::kDecompressError ||
-        kind == iceberg::ErrorKind::kUnknownError;
-}
-
+// Every path read here comes from committed metadata: malformed or missing
+// persisted state is corruption.
 template <class T>
 T Take(iceberg::Result<T> result, std::string_view code, std::string_view context)
 {
     if (!result) {
-        const auto effective = IsCorruptionKind(result.error().kind) ? "CORRUPTION" : code;
-        throw Failure({std::string(effective),
-            BoundedDiagnostic(std::string(context) + ": " + result.error().message),
-            RetryHint::OperatorAction});
+        throw Failure(StorageError(result.error(), EStoragePath::Read, context, code));
     }
     return std::move(*result);
 }
@@ -120,7 +113,7 @@ void AppendFiles(const iceberg::TableMetadata& metadata,
         {
             Unsupported("only Parquet data files are supported");
         }
-        Require(file->file_size_in_bytes > 0 && file->record_count >= 0,
+        Require(file->file_size_in_bytes > 0 && file->record_count > 0,
             "CORRUPTION",
             "manifest has invalid data file metrics");
         files.push_back({file->file_path, file->file_size_in_bytes, file->record_count});

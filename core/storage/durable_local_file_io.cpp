@@ -2,6 +2,7 @@
 
 #include "core/io/durable_file.h"
 #include "core/io/store_uri.h"
+#include "core/storage/iceberg_error_boundary.h"
 
 #include <algorithm>
 #include <atomic>
@@ -16,13 +17,24 @@ namespace {
 
 using TAttempt = std::shared_ptr<NIO::TIOAttempt>;
 
+// Identity violations of store paths are corruption: a symlink (ELOOP with
+// O_NOFOLLOW), a non-directory or a cross-device entry where the store layout
+// requires its own directory or file.
+bool IsLayoutViolation(std::error_code error)
+{
+    return error == std::errc::state_not_recoverable || error == std::errc::too_many_symbolic_link_levels ||
+        error == std::errc::not_a_directory || error == std::errc::cross_device_link;
+}
+
 std::unexpected<iceberg::Error> Failure(std::error_code error, std::string_view path, const TAttempt& attempt = {})
 {
     if (attempt) {
         attempt->FailFile(path, error);
     }
     auto kind = iceberg::ErrorKind::kIOError;
-    if (error == std::errc::file_exists) {
+    if (IsLayoutViolation(error)) {
+        kind = iceberg::ErrorKind::kInvalid;
+    } else if (error == std::errc::file_exists) {
         kind = iceberg::ErrorKind::kAlreadyExists;
     } else if (error == std::errc::no_such_file_or_directory) {
         kind = iceberg::ErrorKind::kNotFound;
@@ -30,12 +42,24 @@ std::unexpected<iceberg::Error> Failure(std::error_code error, std::string_view 
         kind = iceberg::ErrorKind::kInvalidArgument;
     } else if (error == std::errc::operation_not_permitted || error == std::errc::operation_canceled) {
         kind = iceberg::ErrorKind::kNotAllowed;
-    } else if (error == std::errc::state_not_recoverable) {
-        kind = iceberg::ErrorKind::kInvalid;
     }
-    std::string message = kind == iceberg::ErrorKind::kInvalid ? "CORRUPTION: " : "";
+    std::string message = kind == iceberg::ErrorKind::kInvalid ? std::string(CorruptionPrefix) : std::string();
     message += std::string(path) + ": " + error.message();
     return std::unexpected(iceberg::Error{kind, std::move(message)});
+}
+
+// Opening an existing store file: a non-regular file (invalid_argument from
+// OpenRead) or one larger than its file-kind limit cannot have been published.
+std::unexpected<iceberg::Error> ReadFailure(std::error_code error, std::string_view path, const TAttempt& attempt)
+{
+    if (error == std::errc::invalid_argument || error == std::errc::file_too_large) {
+        if (attempt) {
+            attempt->FailFile(path, error);
+        }
+        return std::unexpected(iceberg::Error{iceberg::ErrorKind::kInvalid,
+            std::string(CorruptionPrefix) + std::string(path) + ": " + error.message()});
+    }
+    return Failure(error, path, attempt);
 }
 
 template <typename Function>
@@ -160,7 +184,7 @@ struct TInputContext
             return Failure(Code(std::errc::state_not_recoverable), Path, Attempt);
         }
         if (info.Value().Size > State->Limit(Kind)) {
-            return Failure(Code(std::errc::file_too_large), Path, Attempt);
+            return ReadFailure(Code(std::errc::file_too_large), Path, Attempt);
         }
         return static_cast<std::int64_t>(info.Value().Size);
     }
@@ -570,7 +594,7 @@ TDurableLocalFileIO::Input(std::string location, std::optional<std::uint64_t> le
         }
         auto file = State_->Directories->Fs()->OpenRead(*directory, uri->Leaf());
         if (!file) {
-            return Failure(file.Error(), location, attempt);
+            return ReadFailure(file.Error(), location, attempt);
         }
         auto info = State_->Directories->Fs()->Stat(file.Value());
         if (!info) {
@@ -580,7 +604,7 @@ TDurableLocalFileIO::Input(std::string location, std::optional<std::uint64_t> le
             return Failure(Code(std::errc::state_not_recoverable), location, attempt);
         }
         if (info.Value().Size > State_->Limit(uri->Kind())) {
-            return Failure(Code(std::errc::file_too_large), location, attempt);
+            return ReadFailure(Code(std::errc::file_too_large), location, attempt);
         }
         auto context = std::make_shared<TInputContext>(
             TInputContext{State_, *directory, location, std::string(uri->Leaf()), uri->Kind(), info.Value(), attempt});

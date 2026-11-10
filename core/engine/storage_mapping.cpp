@@ -172,4 +172,33 @@ Result<std::shared_ptr<arrow::RecordBatch>> MakeRecordBatch(const SchemaSpec& sc
     return arrow::RecordBatch::Make(MakeArrowSchema(schema), static_cast<int64_t>(rows.size()), std::move(columns));
 }
 
+int64_t EstimateRecordBatchBytes(const SchemaSpec& schema, const std::vector<Row>& rows)
+{
+    const auto count = static_cast<int64_t>(rows.size());
+    const auto bitmap = (count + 7) / 8;
+    int64_t total = 0;
+    for (size_t column = 0; column < schema.fields.size(); ++column) {
+        total += bitmap;
+        switch (schema.fields[column].type) {
+            case FieldType::String:
+                total += 4 * (count + 1);
+                for (const auto& row : rows) {
+                    if (const auto* text = column < row.size() ? std::get_if<std::string>(&row[column]) : nullptr) {
+                        total += static_cast<int64_t>(text->size());
+                    }
+                }
+                break;
+            case FieldType::Bool:
+                total += bitmap;
+                break;
+            case FieldType::Int64:
+            case FieldType::Float64:
+            case FieldType::TimestampUsUtc:
+                total += 8 * count;
+                break;
+        }
+    }
+    return total;
+}
+
 } // namespace glamdb::detail

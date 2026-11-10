@@ -488,7 +488,11 @@ struct Engine::Impl
     FailBound(const BoundOperation& binding, CommitPhase phase, ErrorDetail error, bool publication_started = false)
     {
         error.message = BoundedDiagnostic(error.message);
-        error.retry_hint = RetryHint::NewOperationId;
+        // The bound ID is consumed either way. Capacity and corruption need
+        // operator action before any new operation can succeed.
+        const bool operatorAction = error.code == "RESOURCE_EXHAUSTED" || error.code == "CORRUPTION" ||
+            error.code == "UNSUPPORTED_STORE_VERSION";
+        error.retry_hint = operatorAction ? RetryHint::OperatorAction : RetryHint::NewOperationId;
         auto failure = Rejected(binding.operation_id, phase, error);
         try {
             catalog->RecordFailure(binding, failure);

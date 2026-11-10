@@ -2,9 +2,16 @@
 
 #include <iceberg/result.h>
 
+#include <string_view>
 #include <utility>
 
 namespace NGlamDB::NStorage {
+
+// Stable message prefixes that classify storage failures for the engine.
+// CORRUPTION: committed or retained state violates a storage invariant.
+// CAPACITY: a configured storage or file limit would be exceeded.
+inline constexpr std::string_view CorruptionPrefix = "CORRUPTION: ";
+inline constexpr std::string_view CapacityPrefix = "CAPACITY: ";
 
 template <typename Function>
 auto CatchIcebergExceptions(Function&& function) -> decltype(std::forward<Function>(function)());
