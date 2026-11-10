@@ -537,7 +537,8 @@ TEST(EngineBootstrap, PublicFactoriesWithoutStorageFailClosed)
     EXPECT_EQ(test::Present(collection.error).code, "DEPENDENCY_UNAVAILABLE");
     const auto scan = (*created)->Scan({.collection_id = test::collection_id});
     ASSERT_FALSE(scan);
-    EXPECT_EQ(scan.error().code, "COLLECTION_NOT_FOUND");
+    // The scanner is not built, so no collection lookup is needed to refuse.
+    EXPECT_EQ(scan.error().code, "DEPENDENCY_UNAVAILABLE");
     EXPECT_TRUE((*created)->Shutdown(std::chrono::milliseconds(1000)));
 }
 #endif

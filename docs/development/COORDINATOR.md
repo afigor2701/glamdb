@@ -12,9 +12,10 @@ eight-collection limit; this MVP has no collection pagination.
 
 The bridge from the coordinator to the [durable storage primitives](STORAGE_MODULE.md)
 and the scanner are described in [SCANNER.md](SCANNER.md); they are built with
-`GLAMDB_BUILD_STORAGE=ON` and are not yet validated against the pinned Iceberg
-build. Without them, public factories can create/open an empty catalog and
-collection creation reports `DEPENDENCY_UNAVAILABLE`. Opening a populated store
+`GLAMDB_BUILD_STORAGE=ON` and tested against the pinned Arrow, Parquet, Iceberg
+and SQLite build (see its validation status). Without them, public factories
+can create/open an empty catalog, and collection creation and scans report
+`DEPENDENCY_UNAVAILABLE`. Opening a populated store
 requires the storage validator. Coordinator test doubles are confined to
 `tests/`; they produce no real Parquet or Avro data. The separate storage
 component tests do exercise real Parquet, Avro and JSON files. There is no HTTP
@@ -42,7 +43,10 @@ deletion in this MVP.
   optional snapshot, schema and partition-spec IDs. Retrying identical content
   returns the original terminal result before evaluating a new precondition,
   reserving owned input or admitting another operation. Different content
-  conflicts. Arrow input errors use `FixInput`.
+  conflicts. Arrow input errors use `FixInput`. A bound operation that fails
+  with `RESOURCE_EXHAUSTED`, `CORRUPTION` or `UNSUPPORTED_STORE_VERSION` keeps
+  its permanent failed outcome with `OperatorAction`; other bound failures use
+  `NewOperationId`.
 - Publication owns `BEGIN IMMEDIATE` through final COMMIT. Inner Iceberg
   transactions join that scope. A guard runs before the single INSERT/CAS;
   registry/pointer, snapshot identity and terminal receipt commit atomically.
@@ -50,6 +54,11 @@ deletion in this MVP.
   ignored. Ordinary failure records a permanent failed outcome. Bounded error
   diagnostics retain a valid UTF-8 prefix of at most 2048 bytes, so truncation
   cannot make a failure outcome unencodable or block live reconciliation.
+- Detected corruption, from any thread, closes readiness and advances a health
+  generation. A write admitted under an older generation does not publish:
+  the final health decision runs inside the catalog guard while a commit gate
+  is held through the outer COMMIT, so a concurrent corruption report either
+  prevents that publication or is surfaced after it completes.
 - An uncertain binding/publication/failure-recording result closes readiness.
   Reconciliation closes the old handle, reopens authoritative SQLite state,
   validates retained storage in both directions, and commits a real fence
@@ -180,6 +189,8 @@ by catalog-selected recovery and receipt/row checks in a fresh process. See the
 [storage guide](STORAGE_MODULE.md#tests-and-evidence) for its cases and boundaries.
 
 Independent catalog, coordinator and SDK reviews exercised these boundaries;
-their confirmed correctness defects have regression tests. A production
-coordinator-to-storage append/read, scan semantics, restore,
-combined capacity/RSS and OS-cache-loss/power-cut qualification remain NOT RUN.
+their confirmed correctness defects have regression tests. Production
+coordinator-to-storage appends and scans are exercised in-process by
+`glamdb_vertical` and in fresh processes by `glamdb.scan_process` (see
+[SCANNER.md](SCANNER.md#validation-status)). Restore, combined capacity/RSS and
+OS-cache-loss/power-cut qualification remain NOT RUN.

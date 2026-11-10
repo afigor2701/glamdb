@@ -206,8 +206,16 @@ storage and `BUILD_TESTING`, builds all native test targets, and runs CTest with
 label/name filters. Installed-consumer tests remain included because the CI
 toolchain propagates instrumentation to consumer builds too.
 
-CMake recursively discovers `.cpp` files inside the unit, I/O, storage, and fault
-suites, with `CONFIGURE_DEPENDS`; GoogleTest discovers their test cases. Add new
+The normal job additionally runs three named contours from `scripts/ci-native.sh`:
+`vertical` (`ctest -L vertical`, the public API over the real storage backend),
+`nostorage` (a separate `GLAMDB_BUILD_STORAGE=OFF`, `GLAMDB_IO_ONLY=OFF` build and
+its full CTest run with the fake coordinator backend) and `mock` (`ctest -L mock`,
+in-memory planner/cursor tests run from a read-only working and temporary
+directory). The read-only directory catches accidental writes there; it is not a
+syscall-level no-I/O proof.
+
+CMake recursively discovers `.cpp` files inside the unit, I/O, storage, mock,
+vertical and fault suites, with `CONFIGURE_DEPENDS`; GoogleTest discovers their test cases. Add new
 cases or test files there without editing CI. Tooling Python files are discovered
 by unittest. Native integration drivers remain registered in CMake because their
 binary arguments differ. New standalone CMake projects under `probes/` are also

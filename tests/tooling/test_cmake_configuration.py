@@ -75,6 +75,27 @@ class CmakeConfigurationTest(unittest.TestCase):
         commands = json.loads((self.build / "compile_commands.json").read_text())
         self.assertIn(str(added), {entry["file"] for entry in commands})
 
+    def test_storage_off_configures_core_without_storage_targets(self):
+        prefix = os.environ.get("GLAMDB_TEST_PREFIX")
+        if not prefix or not any((Path(path) / library / "cmake/Arrow").is_dir()
+                                 for path in prefix.split(";") for library in ("lib", "lib64")):
+            self.skipTest("the pinned dependency prefix is not configured")
+        shutil.copytree(ROOT / "public", self.source / "public")
+        cli11 = self.source / "third_party/cli11"
+        cli11.parent.mkdir()
+        cli11.symlink_to(ROOT / "third_party/cli11", target_is_directory=True)
+        result = self.configure("-DGLAMDB_IO_ONLY=OFF", "-DGLAMDB_BUILD_STORAGE=OFF", "-DBUILD_TESTING=OFF",
+                                f"-DCMAKE_PREFIX_PATH={prefix}", "-DCMAKE_CXX_SCAN_FOR_MODULES=OFF")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        commands = json.loads((self.build / "compile_commands.json").read_text())
+        files = {Path(entry["file"]).relative_to(self.source).as_posix(): entry for entry in commands}
+        self.assertIn("core/engine/engine.cpp", files)
+        self.assertNotIn("GLAMDB_HAS_STORAGE", files["core/engine/engine.cpp"]["command"])
+        for absent in ("core/backend/local_storage_backend.cpp", "core/scan/scan_cursor.cpp",
+                       "core/storage/data_file_writer.cpp"):
+            self.assertNotIn(absent, files)
+        self.assertNotIn("glamdb_storage", (self.build / "build.ninja").read_text())
+
     def test_io_probe_requires_storage(self):
         result = self.configure("-DBUILD_TESTING=OFF", "-DGLAMDB_BUILD_IO_PROBE=ON")
         self.assertNotEqual(result.returncode, 0)

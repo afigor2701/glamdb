@@ -94,14 +94,23 @@ case "$stage" in
       -DGLAMDB_BUILD_STORAGE=ON -DGLAMDB_BUILD_IO_PROBE=ON -DGLAMDB_IO_ONLY=OFF -DBUILD_TESTING=ON \
       -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
     cmake --build "$build" --parallel 2
+    if [[ $profile == normal ]]; then
+      # The engine without storage adapters: public factories install no
+      # backend; coordinator tests use the fake storage double.
+      cmake --preset local -B "$build-nostorage" "${configure[@]}" \
+        -DGLAMDB_BUILD_STORAGE=OFF -DGLAMDB_IO_ONLY=OFF -DBUILD_TESTING=ON \
+        -DCMAKE_GTEST_DISCOVER_TESTS_DISCOVERY_MODE=PRE_TEST
+      cmake --build "$build-nostorage" --parallel 2
+    fi
     ;;
   test)
     result=0
     run_tests() {
       local directory=$1 name=$2
+      shift 2
       ctest --test-dir "$directory" --output-on-failure --no-tests=error \
         --parallel 2 --output-log "$logs/$name-ctest.log" \
-        --output-junit "$logs/$name-junit.xml" || {
+        --output-junit "$logs/$name-junit.xml" "$@" || {
           result=1
           # CTest's console output can be truncated; retain the complete diagnostic.
           if [[ -f $directory/Testing/Temporary/LastTest.log ]]; then
@@ -110,6 +119,18 @@ case "$stage" in
         }
     }
     run_tests "$build" project
+    if [[ $profile == normal ]]; then
+      # Named contours: (1) public API over the real storage backend,
+      # (2) the engine built without storage, (3) in-memory planner/cursor
+      # tests with a read-only working and temporary directory.
+      run_tests "$build" vertical -L vertical
+      run_tests "$build-nostorage" nostorage
+      readonly_dir=$(mktemp -d)
+      chmod 0555 "$readonly_dir"
+      (cd "$readonly_dir" && export TMPDIR="$readonly_dir" && run_tests "$build" mock -L mock \
+        && exit "$result") || result=1
+      chmod 0755 "$readonly_dir" && rmdir "$readonly_dir"
+    fi
     # Discover standalone CMake test projects; no CI list of individual tests.
     for project in probes/*/CMakeLists.txt; do
       [[ -f $project ]] || continue

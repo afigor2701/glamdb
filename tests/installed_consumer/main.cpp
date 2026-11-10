@@ -15,10 +15,10 @@ int CheckAppendAndScan(glamdb::Engine& engine)
     const glamdb::SchemaSpec schema{{{"key", glamdb::FieldType::String, false}, {"n", glamdb::FieldType::Int64, true}}};
     const auto created = engine.CreateCollection({CollectionId, "events", schema});
     if (created.disposition != glamdb::CommitDisposition::Committed) {
-        // A package built without storage installs no backend.
+        // A package built without storage installs no backend or scanner.
         const auto scan = engine.Scan({.collection_id = CollectionId});
         return created.error && created.error->code == "DEPENDENCY_UNAVAILABLE" && !scan &&
-                scan.error().code == "COLLECTION_NOT_FOUND"
+                scan.error().code == "DEPENDENCY_UNAVAILABLE"
             ? 0
             : 10;
     }

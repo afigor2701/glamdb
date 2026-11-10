@@ -58,6 +58,16 @@ property extensions and changes to that profile are rejected before publication.
 Snapshot-log timestamps refer to their snapshots. The root update timestamp is
 independent and is preserved on recovery, including when the wall clock moves.
 
+Failures that the engine must classify carry stable message prefixes from
+`core/storage/iceberg_error_boundary.h`: `CORRUPTION: ` marks a violated storage
+invariant and `CAPACITY: ` a configured storage or file limit (candidate store
+usage, candidate root size, append accumulators and the Parquet file limit).
+The durable FileIO reports store-layout violations as `kInvalid` with the
+corruption prefix: a symlink (ELOOP with `O_NOFOLLOW`), a non-directory or
+cross-device entry, and, when opening an existing file, a non-regular file or
+one larger than its file-kind limit. See
+[SCANNER.md](SCANNER.md#error-classification) for the engine mapping.
+
 ## Read, recovery, and copy boundaries
 
 Reads on the binding thread participate in its active attempt and I/O budget.

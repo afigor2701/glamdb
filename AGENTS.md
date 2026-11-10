@@ -129,7 +129,7 @@ Preserve these boundaries when adding or changing engine behavior:
 | `core/storage/` | FileIO, Parquet writer, Iceberg staging, publication/recovery and capacity checks (`glamdb_storage`). |
 | `apps/glamdb/` | Store-management CLI using CLI11 and transport-only outcome serialization. |
 | `cmake/` | Build options, sanitizers, quality targets, and dependency recipes. |
-| `tests/` | Native unit/recovery/SqlCatalog/VFS/consumer suites, `vertical/` public-API storage tests, verification and actual SDK HTTP/HTTPS tests. |
+| `tests/` | Native unit/recovery/SqlCatalog/VFS/consumer suites, `vertical/` public-API storage tests, `mock/` in-memory scan tests, verification and actual SDK HTTP/HTTPS tests. |
 | `apps/mock_server/` | Disposable Python mock, real HTTP/Arrow, no warehouse/catalog access. |
 | `fixtures/`, `tools/verification/` | Literal canonical/metadata inputs, independent row oracle and evidence helpers. |
 | `sdk/python/`, `ui/` | Standalone Python HTTP SDK; HTML/CSS/ES-module pink workbench and browser/unit tests. |
@@ -178,7 +178,9 @@ Native CI runs normal, ASan, UBSan, MSan, TSan, and LSan independently via
 libc++/libc++abi with instrumentation; other profiles use ordinary dependencies.
 MSan disables Arrow's custom allocators at build time and uses the system allocator.
 CTest discovers GoogleTest cases, and CMake discovers test `.cpp` files within
-the unit, I/O, storage, vertical, and fault suites. Tooling tests use unittest discovery.
+the unit, I/O, storage, mock, vertical, and fault suites. Tooling tests use unittest discovery.
+The normal profile also runs named `vertical`, `nostorage` (a separate
+`GLAMDB_BUILD_STORAGE=OFF` build) and `mock` contours.
 Python tests use repository-wide pytest discovery (excluding native tooling,
 vendor, and generated trees); Node and Playwright use their own discovery.
 Both test workflows skip documentation-only changes. See
@@ -198,8 +200,11 @@ also require GoogleTest. The CLI uses the pinned, header-only CLI11 submodule;
 it is not part of the public engine API or dependency installation. Use `release`
 or `asan-ubsan` in place of `local` for the corresponding configure, build, and
 test presets. `GLAMDB_BUILD_STORAGE` defaults to `ON` (unless `GLAMDB_IO_ONLY=ON`)
-and adds `glamdb_storage`, the production backend, the scanner and `glamdb_vertical`
-(CTest labels `vertical;scan`); with it `OFF`, public factories install no backend.
+and adds `glamdb_storage`, the production backend, the scanner, `glamdb_vertical`
+(CTest labels `vertical;scan`), the in-memory planner/cursor suite `glamdb_mock`
+(labels `mock;scan`) and the fresh-process `glamdb.scan_process` integration test;
+with it `OFF`, public factories install no backend and `Engine::Scan` reports
+`DEPENDENCY_UNAVAILABLE`.
 Core protocol tests use a test-only backend through `EngineFactory::Create/Open`;
 the real SqlCatalog test verifies the catalog integration separately. Neither
 establishes durable user-file production or power-loss safety.

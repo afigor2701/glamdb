@@ -38,16 +38,58 @@ ready backend remain for coordinator tests.
 - Guard candidates are tentative until the coordinator confirms the outer
   SQLite `COMMIT` via `ConfirmPublication` (or a later binding/recovery
   observes the committed root). Rollback discards the tentative candidate.
-- `VerifyRetained` verifies every collection root, its schema, a one-to-one
-  mapping between retained snapshots and committed receipts, and the aggregate
-  multi-collection store usage against `TStorageLimits::Store`. Missing or
-  inconsistent committed state is `CORRUPTION`, which closes readiness.
+- `VerifyRetained` runs the full `VerifyReachable` closure check for every
+  collection root (manifest lists, manifests, data file lengths and Parquet
+  footers), its schema, a one-to-one mapping between retained snapshots and
+  committed receipts, and the aggregate multi-collection store usage against
+  `TStorageLimits::Store`. It runs on open, `Reconcile()` and every idempotent
+  retry of a committed create or append, so a retry never returns a committed
+  outcome over missing or corrupt files. Missing or inconsistent committed
+  state is `CORRUPTION`, which closes readiness.
+- Corruption reports and publication are ordered by the engine's commit gate.
+  The writer takes it immediately before the guard's final health decision and
+  holds it through the outer `COMMIT`; a reader that detects corruption takes
+  it before closing readiness. Corruption observed before that decision rolls
+  the publication back; corruption observed after it is surfaced only once the
+  publication has completed.
 
-Known limits: `CheckAppendAdmissible` checks writer row/byte limits (1..10000
-rows, 2 MiB per row including fixed slot headers for `NULL` cells, 16 MiB Arrow
-buffer total) and storage capacity preflight before the coordinator binds the
-operation in SQLite. The default storage limits require free-space reserves
-(see `TStorageLimits`). Orphan files from failed attempts remain.
+`CheckAppendAdmissible` runs before the coordinator binds the operation in
+SQLite, so a rejection consumes no operation ID and writes no file. It checks
+writer row/byte limits (1..10000 rows, 2 MiB per row including fixed slot
+headers for `NULL` cells, 16 MiB Arrow buffers, estimated without building a
+batch), the warehouse preflight, the exact base root against
+`TStorageLimits::RootBytes` and `MetadataLogEntries`, and the minimum store
+usage increment of one append. Exactly one Arrow batch is built per append.
+Limits that only the produced files reveal (`MaxFileBytes`, candidate root
+size, aggregate usage) fail after binding as `RESOURCE_EXHAUSTED` with
+`OperatorAction`; the ID stays permanently failed. The default storage limits
+require free-space reserves (see `TStorageLimits`). Orphan files from failed
+attempts remain.
+
+A failed durable write sets the backend's write latch for this engine
+instance. It blocks further writes with `IO_ERROR`/`OperatorAction` before
+binding; verification, scans, `Reconcile()` and `Shutdown()` remain available.
+Shut down and reopen the store to write again.
+
+### Error classification
+
+Storage failures map to engine codes as follows. Read paths only use locations
+taken from committed metadata, so malformed or missing persisted state there
+is corruption. Every `CORRUPTION` closes readiness.
+
+| Source | Condition | Engine code |
+| --- | --- | --- |
+| `state_not_recoverable`, ELOOP (symlink with `O_NOFOLLOW`), `not_a_directory`, `cross_device_link`, `no_such_file_or_directory` | any store path | `CORRUPTION` |
+| `invalid_argument` | warehouse preflight (symlink or special file) or opening a committed file that is not regular | `CORRUPTION` |
+| `file_too_large` | reading a committed file / write budget | `CORRUPTION` / `RESOURCE_EXHAUSTED` |
+| `no_space_on_device`, `value_too_large`, `not_enough_memory` | any | `RESOURCE_EXHAUSTED` |
+| write latch, `io_error`, `read_only_file_system`, `permission_denied`, other | any | `IO_ERROR` |
+| Iceberg `kInvalid`, `kInvalidArgument`, `kNotFound`, `kValidationFailed`, `kDecompressError`, `kUnknownError`, `kInvalidManifest(List)`, `kInvalidSchema`, `kJsonParseError`; decoder exceptions | read paths | `CORRUPTION` |
+| message prefix `CORRUPTION: ` | any | `CORRUPTION` |
+| message prefix `CAPACITY: ` | write paths / read paths | `RESOURCE_EXHAUSTED` / `CORRUPTION` |
+
+An `invalid_argument` from a `statfs` anomaly in the preflight is not
+distinguishable from a planted special file and also fails closed.
 
 ## Scan path
 
@@ -65,9 +107,13 @@ joins a writer attempt or holds a SQLite read transaction.
   UNKNOWN and never returned, which equals SQL three-valued logic for a single
   comparison. Strings compare by unsigned UTF-8 bytes; literal `-0.0` matches
   stored `0.0`; NaN/Inf and out-of-range timestamps are `INVALID_ARGUMENT`.
-- Each file is read whole (at most 32 MiB in this profile), opened with
-  `parquet::arrow`, checked against the field IDs 1..N and the manifest row
-  count, then filtered, projected and limited. Batches have at most
+- Each file is read whole (at most 32 MiB in this profile) and its footer is
+  checked by the same verifier as recovery: exact field IDs 1..N, names,
+  repetition, physical/logical types, row group counts and the manifest row
+  count. Before any value is returned, every decoded column is validated:
+  Arrow `ValidateFull` (offsets and UTF-8), string limits (1024 bytes for
+  `key`, 1 MiB otherwise), finite non-negative-zero floats and timestamps in
+  years 0001..9999. Then rows are filtered, projected and limited. Batches have at most
   `batch_rows` rows and the exact `Info().output_schema`. `limit = 0` and empty
   views return `nullptr` from the first `Next()`.
 - Both the cursor and returned Arrow buffers retain the store lease until the
@@ -77,14 +123,21 @@ joins a writer attempt or holds a SQLite read transaction.
   closes engine readiness. Read failures are errors, never EOS.
 
 Not implemented: file/row-group pruning, compound predicates (`And`, `Or`,
-`Not`, `In`, `IsNull`), streaming planning, runtime memory leases and quotas.
+`Not`, `In`, `IsNull`), streaming planning, runtime memory leases and quotas,
+page CRC verification, per-device physical/inode budgets and in-flight
+reservations, and measured attempt-volume/capacity qualification.
 
 ## Validation status
 
 | Check | Status |
 | --- | --- |
-| `cmake --preset local && cmake --build --preset local` (GCC 14.2.0, `GLAMDB_BUILD_STORAGE=ON`) | PASS |
-| `tests/unit/storage_mapping_test.cpp`, `tests/unit/scan_predicate_test.cpp` (`glamdb_unit`) | 10/10 PASS |
-| `tests/vertical/engine_vertical_test.cpp` (`glamdb_vertical`, CTest labels `vertical;scan`) | 15/15 PASS |
-| `ctest --preset local` (`unit`, `vertical`, `fault`, `integration`, `installed_consumer`, `tooling`, `smoke`) | 369/369 PASS (standalone `RecoveryChildProcess` helper skipped as expected; executed by its parent test) |
-| `cmake --build --preset local --target format-check` and `clang-tidy-18` on new/modified TUs | PASS (`format-check` 117/117 files; full-repo `tidy-check` and sanitizer presets not run in this session) |
+| `cmake --build --preset local` (Clang 18.1.3, `GLAMDB_BUILD_STORAGE=ON`) and `format-check`, `quality-negative-check` | PASS |
+| `ctest --preset local` (unit, mock, vertical, fault, integration including `glamdb.scan_process`, installed consumer, tooling, smoke) | PASS, see the PR description for counts; the standalone `RecoveryChildProcess` helper is skipped as expected |
+| `glamdb_vertical` (`engine_vertical_test.cpp`, `engine_integrity_test.cpp`) | PASS: commit-gate boundaries, layout violations, retry verification, crafted same-length Parquet corruption, quotas, write latch |
+| `glamdb_mock` (label `mock`, in-memory FileIO) | PASS, also from a read-only working/temporary directory |
+| Separate `GLAMDB_BUILD_STORAGE=OFF` build and CTest | PASS |
+| Full-repo `tidy-check`, sanitizer presets, TSan, power-loss qualification | NOT RUN in this change |
+
+Value validation reads only decoded columns of the projection and predicate;
+latent corruption in unread columns or unread data pages is not detected by
+`VerifyReachable`, which checks footers rather than every page.

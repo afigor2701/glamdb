@@ -46,10 +46,15 @@ class CiNativeRunnerTest(unittest.TestCase):
         result = self.run_script("normal", "build")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         commands = [json.loads(line) for line in log.read_text().splitlines()]
-        self.assertEqual(len(commands), 2)
+        # The normal profile also configures and builds the engine without storage.
+        self.assertEqual(len(commands), 4)
         self.assertIn("-DGLAMDB_BUILD_STORAGE=ON", commands[0])
         self.assertIn("-DGLAMDB_BUILD_IO_PROBE=ON", commands[0])
         self.assertEqual(commands[1][:2], ["cmake", "--build"])
+        self.assertIn("-DGLAMDB_BUILD_STORAGE=OFF", commands[2])
+        self.assertIn("-DGLAMDB_IO_ONLY=OFF", commands[2])
+        self.assertNotIn("-DGLAMDB_BUILD_IO_PROBE=ON", commands[2])
+        self.assertEqual(commands[3][:3], ["cmake", "--build", str(self.root / "build/ci-normal-nostorage")])
 
     def test_discovers_standalone_probes_without_reconfiguring_the_io_target(self):
         log = self.record_commands("cmake", "ctest")
@@ -70,7 +75,12 @@ class CiNativeRunnerTest(unittest.TestCase):
                 self.assertEqual(set(configured), expected)
                 tested = [command[2] for command in commands if command[:2] == ["ctest", "--test-dir"]]
                 build = str(self.root / f"build/ci-{profile}")
-                self.assertEqual(set(tested), {build, *(f"{build}-probe-{Path(path).name}" for path in expected)})
+                directories = {build, *(f"{build}-probe-{Path(path).name}" for path in expected)}
+                if profile == "normal":
+                    directories.add(f"{build}-nostorage")
+                self.assertEqual(set(tested), directories)
+                labels = [command[command.index("-L") + 1] for command in commands if "-L" in command]
+                self.assertEqual(labels, ["vertical", "mock"] if profile == "normal" else [])
 
     def test_invalid_profile_or_stage_has_no_build_side_effects(self):
         for arguments in (("bogus", "test"), ("normal", "bogus"), ("asan",), ("normal", "test", "extra")):
