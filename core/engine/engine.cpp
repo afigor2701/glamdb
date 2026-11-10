@@ -138,6 +138,14 @@ struct Engine::Impl
     std::shared_ptr<DurableSqliteCatalogStore> catalog;
     std::shared_ptr<StorageBackend> backend;
     mutable std::mutex state_mutex;
+    // Orders corruption reports against a publication decision. The writer
+    // takes it immediately before its final health check, inside the catalog
+    // guard, and holds it through the outer COMMIT or rollback. A reader that
+    // detects corruption takes it before closing readiness, so its error
+    // either prevents that publication or is surfaced after it completes.
+    // Lock order: catalog mutex -> commit_gate -> state_mutex. The writer
+    // never reports corruption while holding it.
+    std::mutex commit_gate;
     std::timed_mutex writer;
     std::atomic<bool> closing{false};
     bool ready = false;
@@ -178,6 +186,21 @@ struct Engine::Impl
         Require(health_generation == expected_generation,
             "RECOVERY_REQUIRED",
             "authoritative reconciliation is required");
+    }
+
+    // The caller holds commit_gate. Final decision of a publication guard.
+    Status PublicationHealth(uint64_t expected_generation) const
+    {
+        std::lock_guard lock(state_mutex);
+        if (closing.load()) {
+            return std::unexpected(ErrorDetail{"CANCELLED", "engine is closing", RetryHint::OperatorAction});
+        }
+        if (!ready || closed || health_generation != expected_generation) {
+            return std::unexpected(ErrorDetail{"RECOVERY_REQUIRED",
+                "authoritative reconciliation is required",
+                RetryHint::SameIdAfterReconcile});
+        }
+        return {};
     }
 
     // The caller holds state_mutex. Recheck at every admission/writer boundary:
@@ -346,6 +369,7 @@ struct Engine::Impl
     void CloseOnCorruption(const ErrorDetail& error)
     {
         if (error.code == "CORRUPTION" || error.code == "UNSUPPORTED_STORE_VERSION") {
+            std::lock_guard gate(commit_gate);
             if (backend) {
                 backend->InvalidateCache();
             }
@@ -727,6 +751,9 @@ CreateOutcome Engine::CreateCollection(const CreateCollectionRequest& request)
         }
         publication_started = true;
         context->publication_started = true;
+        // Held from the final health check through the outer COMMIT or
+        // rollback; see Impl::commit_gate.
+        std::unique_lock gate(impl->commit_gate, std::defer_lock);
         auto created = impl->catalog->PublishCreate(
             info,
             [&](std::string_view location) -> Status {
@@ -735,34 +762,22 @@ CreateOutcome Engine::CreateCollection(const CreateCollectionRequest& request)
                 if (!verified) {
                     return verified;
                 }
-                std::lock_guard state_lock(impl->state_mutex);
-                if (impl->closing.load()) {
-                    return std::unexpected(ErrorDetail{"CANCELLED", "engine is closing", RetryHint::OperatorAction});
+                if (!gate.owns_lock()) {
+                    gate.lock();
                 }
-                if (!impl->ready || impl->closed || impl->health_generation != expected_generation) {
-                    return std::unexpected(ErrorDetail{"RECOVERY_REQUIRED",
-                        "authoritative reconciliation is required",
-                        RetryHint::SameIdAfterReconcile});
-                }
-                return {};
+                return impl->PublicationHealth(expected_generation);
             },
             [&] {
                 return staged->Publish(*impl->catalog);
             });
         committed = true;
-        bool healthy_after_commit = false;
-        {
-            std::lock_guard state_lock(impl->state_mutex);
-            healthy_after_commit = impl->ready && !impl->closed && impl->health_generation == expected_generation;
-        }
-        if (healthy_after_commit) {
+        if (gate.owns_lock()) {
             if (context->candidate_metadata_location) {
                 impl->backend->ConfirmPublication(created.collection_id, *context->candidate_metadata_location);
             }
-            impl->RefreshCache();
-        } else if (impl->backend) {
-            impl->backend->InvalidateCache();
+            gate.unlock();
         }
+        impl->RefreshCache();
         return {CommitDisposition::Committed, CommitPhase::Complete, created, std::nullopt, std::nullopt};
     } catch (const Failure& error) {
         impl->CloseOnCorruption(error.detail);
@@ -927,8 +942,9 @@ AppendOutcome Engine::AppendDurable(const AppendRequest& request)
         }
         const auto input = Take(NormalizeBatches(collection.schema, request.collection_id, request.batches));
         Require(input.payload_hash == payload_hash, "INVALID_ARGUMENT", "Arrow input changed during append");
+        const auto base = impl->catalog->Base(request.collection_id);
         if (impl->backend) {
-            const auto admissible = impl->backend->CheckAppendAdmissible(impl->info, collection, input);
+            const auto admissible = impl->backend->CheckAppendAdmissible(impl->info, collection, base, input);
             if (!admissible) {
                 throw Failure(admissible.error());
             }
@@ -937,12 +953,7 @@ AppendOutcome Engine::AppendDurable(const AppendRequest& request)
             std::lock_guard state_lock(impl->state_mutex);
             impl->CheckHealthy(expected_generation);
         }
-        binding = BoundOperation{request.collection_id,
-            request.operation_id,
-            input.payload_hash,
-            1,
-            impl->catalog->Base(request.collection_id),
-            NewUuid()};
+        binding = BoundOperation{request.collection_id, request.operation_id, input.payload_hash, 1, base, NewUuid()};
         context = Context(*binding,
             {"RECOVERY_REQUIRED", "append outcome is unresolved", RetryHint::SameIdAfterReconcile},
             false);
@@ -1001,6 +1012,9 @@ AppendOutcome Engine::AppendDurable(const AppendRequest& request)
         publication_started = true;
         context.publication_started = true;
         context.candidate_snapshot_id = receipt.snapshot_id;
+        // Held from the final health check through the outer COMMIT or
+        // rollback; see Impl::commit_gate.
+        std::unique_lock gate(impl->commit_gate, std::defer_lock);
         impl->catalog->PublishAppend(
             *binding,
             receipt,
@@ -1010,34 +1024,22 @@ AppendOutcome Engine::AppendDurable(const AppendRequest& request)
                 if (!verified) {
                     return verified;
                 }
-                std::lock_guard state_lock(impl->state_mutex);
-                if (impl->closing.load()) {
-                    return std::unexpected(ErrorDetail{"CANCELLED", "engine is closing", RetryHint::OperatorAction});
+                if (!gate.owns_lock()) {
+                    gate.lock();
                 }
-                if (!impl->ready || impl->closed || impl->health_generation != expected_generation) {
-                    return std::unexpected(ErrorDetail{"RECOVERY_REQUIRED",
-                        "authoritative reconciliation is required",
-                        RetryHint::SameIdAfterReconcile});
-                }
-                return {};
+                return impl->PublicationHealth(expected_generation);
             },
             [&] {
                 return staged->Publish(*impl->catalog);
             });
         phase = CommitPhase::Complete;
-        bool healthy_after_commit = false;
-        {
-            std::lock_guard state_lock(impl->state_mutex);
-            healthy_after_commit = impl->ready && !impl->closed && impl->health_generation == expected_generation;
-        }
-        if (healthy_after_commit) {
+        if (gate.owns_lock()) {
             if (context.candidate_metadata_location) {
                 impl->backend->ConfirmPublication(binding->collection_id, *context.candidate_metadata_location);
             }
-            impl->RefreshCache();
-        } else if (impl->backend) {
-            impl->backend->InvalidateCache();
+            gate.unlock();
         }
+        impl->RefreshCache();
         {
             std::lock_guard state_lock(impl->state_mutex);
             impl->active.reset();

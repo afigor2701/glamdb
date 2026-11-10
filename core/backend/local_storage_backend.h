@@ -50,6 +50,7 @@ public:
     PrepareCreate(const StoreInfo& store, const CreateCollectionRequest& request, std::string_view attempt_id) override;
     Status CheckAppendAdmissible(const StoreInfo& store,
         const CollectionInfo& collection,
+        const BaseIdentity& base,
         const NormalizedInput& input) override;
     Result<std::unique_ptr<StagedAppend>> PrepareAppend(const StoreInfo& store,
         const BoundOperation& binding,

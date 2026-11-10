@@ -48,7 +48,10 @@ public:
     virtual ~StorageBackend() = default;
     virtual Result<std::unique_ptr<StagedCreate>>
     PrepareCreate(const StoreInfo& store, const CreateCollectionRequest& request, std::string_view attempt_id) = 0;
-    virtual Status CheckAppendAdmissible(const StoreInfo&, const CollectionInfo&, const NormalizedInput&)
+    // Pre-binding admission against the exact committed base that the
+    // coordinator is about to bind. A rejection consumes no operation ID.
+    virtual Status
+    CheckAppendAdmissible(const StoreInfo&, const CollectionInfo&, const BaseIdentity&, const NormalizedInput&)
     {
         return {};
     }

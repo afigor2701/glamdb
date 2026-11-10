@@ -502,6 +502,7 @@ Result<std::unique_ptr<StagedCreate>> TLocalStorageBackend::PrepareCreate(const 
 
 Status TLocalStorageBackend::CheckAppendAdmissible(const StoreInfo& store,
     const CollectionInfo& collection,
+    const BaseIdentity& /*base*/,
     const NormalizedInput& input)
 {
     return Guarded<Status>([&]() -> Status {
