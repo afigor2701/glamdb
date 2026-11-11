@@ -103,7 +103,7 @@ bool MatchesType(const parquet::schema::Node& node, const iceberg::Type& type)
         node.logical_type()->Equals(*logical);
 }
 
-iceberg::Result<TParquetFileInfo> ParseFooter(std::span<const std::byte> bytes,
+iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ParseFooter(std::span<const std::byte> bytes,
     std::int64_t expectedRows,
     const iceberg::Schema& schema,
     const TParquetLimits& limits)
@@ -137,16 +137,26 @@ iceberg::Result<TParquetFileInfo> ParseFooter(std::span<const std::byte> bytes,
     }
     std::int64_t rowCount = 0;
     for (int index = 0; index < metadata->num_row_groups(); ++index) {
-        const auto rows = metadata->RowGroup(index)->num_rows();
-        if (rows < 0 || rows > expectedRows - rowCount) {
+        const auto group = metadata->RowGroup(index);
+        const auto rows = group->num_rows();
+        if (rows < 0 || rows > expectedRows - rowCount || group->num_columns() != metadata->num_columns()) {
             return iceberg::Invalid("CORRUPTION: Invalid Parquet row group count.");
+        }
+        for (int column = 0; column < group->num_columns(); ++column) {
+            const auto chunk = group->ColumnChunk(column);
+            const auto* descriptor = metadata->schema()->Column(column);
+            if (chunk->type() != descriptor->physical_type() ||
+                chunk->path_in_schema()->ToDotVector() != descriptor->path()->ToDotVector())
+            {
+                return iceberg::Invalid("CORRUPTION: Parquet column chunk does not match its schema.");
+            }
         }
         rowCount += rows;
     }
     if (rowCount != expectedRows) {
         return iceberg::Invalid("CORRUPTION: Parquet row groups do not match the total row count.");
     }
-    return TParquetFileInfo{parsedLength, rowCount, metadata->num_row_groups()};
+    return metadata;
 }
 
 class TAvroCursor
@@ -360,9 +370,18 @@ iceberg::Result<TParquetFileInfo> CheckParquet(iceberg::InputFile& file,
     TParquetExpectation expected,
     TParquetLimits limits)
 {
+    ICEBERG_ASSIGN_OR_RAISE(auto metadata, ReadParquetFooter(file, schema, expected, limits));
+    return TParquetFileInfo{metadata->size(), metadata->num_rows(), metadata->num_row_groups()};
+}
+
+iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ReadParquetFooter(iceberg::InputFile& file,
+    const iceberg::Schema& schema,
+    TParquetExpectation expected,
+    TParquetLimits limits)
+{
     const auto expectedLength = expected.Length;
     const auto expectedRows = expected.RowCount;
-    return CatchIcebergExceptions([&]() -> iceberg::Result<TParquetFileInfo> {
+    return CatchIcebergExceptions([&]() -> iceberg::Result<std::shared_ptr<parquet::FileMetaData>> {
         if (expectedRows < 0 || limits.MaxFooterBytes > std::numeric_limits<std::int32_t>::max() ||
             limits.MaxThriftContainerElements <= 0)
         {
@@ -372,8 +391,8 @@ iceberg::Result<TParquetFileInfo> CheckParquet(iceberg::InputFile& file,
         if (size < 12) {
             return iceberg::Invalid("CORRUPTION: Parquet file is truncated.");
         }
-        return WithStream<TParquetFileInfo>(file,
-            [&](iceberg::SeekableInputStream& stream) -> iceberg::Result<TParquetFileInfo> {
+        return WithStream<std::shared_ptr<parquet::FileMetaData>>(file,
+            [&](iceberg::SeekableInputStream& stream) -> iceberg::Result<std::shared_ptr<parquet::FileMetaData>> {
                 std::array<std::byte, 4> header;
                 std::array<std::byte, 8> trailer;
                 ICEBERG_RETURN_UNEXPECTED(stream.ReadFully(0, header));

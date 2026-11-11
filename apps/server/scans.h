@@ -23,6 +23,8 @@ public:
         bool openOnly);
     NTransport::TResponse
     Cancel(const std::string& database, const std::string& collection, const NTransport::TJson& body);
+    // Permanently close admission and mark sessions cancelled without waiting for reads.
+    void Stop();
     void Clear(const std::string& database);
     void Clear();
 

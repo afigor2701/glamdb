@@ -34,7 +34,10 @@ automatic file cleanup remain outside this MVP.
 - The coordinator validates and fingerprints Arrow input without copying the
   payload. It copies into owned normalized rows only for a new operation, after
   acquiring the writer and resolving any previous outcome. Caller-owned Arrow
-  buffers must remain immutable throughout the synchronous call.
+  buffers must remain immutable throughout the synchronous call. Backend admission
+  checks disk/write health and writer limits, then builds the normalized writer
+  batch before binding. Allocation refusal leaves the ID unbound; production
+  reuses the admitted batch. Final publication still rechecks changing capacity.
   Field IDs follow fixed schema order from 1; omitted nullable values become
   NULL, duplicate rows remain, float negative zero normalizes, nonfinite floats
   fail, and timestamps are UTC microseconds in years 0001 through 9999. SHA-256
@@ -43,7 +46,12 @@ automatic file cleanup remain outside this MVP.
   Its exact base includes store/collection/table identities, metadata location,
   optional snapshot, schema and partition-spec IDs. Retrying identical content
   returns the original terminal result before evaluating a new precondition,
-  reserving owned input or admitting another operation. Different content
+  reserving owned input or admitting another operation. Healthy terminal lookups
+  query only the requested catalog record, reusing the verified generation from
+  open/reconciliation and confirmed publications. They neither enumerate retained
+  operations nor scrub warehouse files. Observed corruption or uncertain
+  publication closes this path until authoritative recovery and its durability
+  fence succeed; a write-only I/O latch still permits old receipts. Different content
   conflicts: the public API rejects that request as `DefinitelyNotCommitted`
   with `OPERATION_CONFLICT`, which describes only the conflicting request, not
   the bound operation (which may be committed or unknown). Outcome JSON

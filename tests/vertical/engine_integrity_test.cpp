@@ -276,9 +276,9 @@ TEST_F(EngineIntegrityTest, FifoReplacingManifestIsCorruption)
     ASSERT_TRUE(Engine_->Reconcile());
 }
 
-// ---- Idempotent retries verify the full retained closure ----
+// ---- Observed corruption fences terminal receipt lookups until recovery ----
 
-TEST_F(EngineIntegrityTest, RetryAfterDeletedParquetFailsClosed)
+TEST_F(EngineIntegrityTest, RetryAfterObservedDeletedParquetRequiresRecovery)
 {
     CreateTwoCollections();
     CommitFirst();
@@ -289,12 +289,20 @@ TEST_F(EngineIntegrityTest, RetryAfterDeletedParquetFailsClosed)
     const auto dataFile = OnlyDataFile(test::collection_id);
     const auto saved = ReadBytes(dataFile);
     std::filesystem::remove(dataFile);
+    const auto cursor = OpenCursor(test::collection_id);
+    ASSERT_NE(cursor, nullptr);
+    const auto next = cursor->Next();
+    ASSERT_FALSE(next);
+    EXPECT_EQ(next.error().code, "CORRUPTION");
 
     const auto retry = Engine_->AppendDurable({test::collection_id, FirstOperation, {}, {Batch(FirstRows)}});
     EXPECT_EQ(retry.disposition, CommitDisposition::CommitUnknown);
     ASSERT_TRUE(retry.error);
-    EXPECT_EQ(test::Present(retry.error).code, "CORRUPTION");
+    EXPECT_EQ(test::Present(retry.error).code, "RECOVERY_REQUIRED");
     EXPECT_EQ(Engine_->GetCollection(test::collection_id).error().code, "RECOVERY_REQUIRED");
+
+    EXPECT_FALSE(Engine_->FindAppendOutcome(test::collection_id, FirstOperation));
+    EXPECT_FALSE(Engine_->Reconcile());
 
     WriteBytes(dataFile, saved);
     ASSERT_TRUE(Engine_->Reconcile());
@@ -304,7 +312,7 @@ TEST_F(EngineIntegrityTest, RetryAfterDeletedParquetFailsClosed)
     EXPECT_EQ(test::Present(again.result).snapshot_id, test::Present(test::Present(*original).result).snapshot_id);
 }
 
-TEST_F(EngineIntegrityTest, RetryAfterSameLengthGarbageRootFailsClosed)
+TEST_F(EngineIntegrityTest, RetryAfterObservedGarbageRootRequiresRecovery)
 {
     CreateTwoCollections();
     CommitFirst();
@@ -314,11 +322,17 @@ TEST_F(EngineIntegrityTest, RetryAfterSameLengthGarbageRootFailsClosed)
     ASSERT_EQ(roots.size(), 1U);
     const auto saved = ReadBytes(roots.front());
     WriteBytes(roots.front(), std::string(saved.size(), 'x'));
+    const auto scan = Engine_->Scan({.collection_id = test::collection_id});
+    ASSERT_FALSE(scan);
+    EXPECT_EQ(scan.error().code, "CORRUPTION");
 
     const auto retry = Engine_->AppendDurable({test::collection_id, FirstOperation, {}, {Batch(FirstRows)}});
     EXPECT_EQ(retry.disposition, CommitDisposition::CommitUnknown);
     ASSERT_TRUE(retry.error);
-    EXPECT_EQ(test::Present(retry.error).code, "CORRUPTION");
+    EXPECT_EQ(test::Present(retry.error).code, "RECOVERY_REQUIRED");
+
+    EXPECT_FALSE(Engine_->FindAppendOutcome(test::collection_id, FirstOperation));
+    EXPECT_FALSE(Engine_->Reconcile());
 
     WriteBytes(roots.front(), saved);
     ASSERT_TRUE(Engine_->Reconcile());

@@ -32,6 +32,7 @@
 #include <charconv>
 #include <format>
 #include <limits>
+#include <new>
 #include <optional>
 #include <set>
 #include <unordered_map>
@@ -46,6 +47,14 @@ namespace NStorage = NGlamDB::NStorage;
 constexpr std::string_view CatalogNamespace = "columnar";
 constexpr std::string_view OperationKey = "glamdb.operation-id";
 constexpr std::string_view ContentHashKey = "glamdb.content-hash";
+
+// Arrow buffers borrow their pool. The aliasing batch handle keeps the pool
+// alive even if a backend caller retains it after releasing the backend.
+struct TAdmittedBatch
+{
+    std::shared_ptr<arrow::MemoryPool> Pool;
+    std::shared_ptr<arrow::RecordBatch> Batch;
+};
 
 [[noreturn]] void Fail(std::string_view code, std::string_view context, std::string_view message)
 {
@@ -140,6 +149,9 @@ TResult Guarded(TFunction&& body)
         return body();
     } catch (const Failure& error) {
         return std::unexpected(error.detail);
+    } catch (const std::bad_alloc& error) {
+        return std::unexpected(
+            ErrorDetail{"RESOURCE_EXHAUSTED", BoundedDiagnostic(error.what()), RetryHint::OperatorAction});
     } catch (const std::exception& error) {
         return std::unexpected(ErrorDetail{"INTERNAL", BoundedDiagnostic(error.what()), RetryHint::OperatorAction});
     }
@@ -540,7 +552,7 @@ Result<std::unique_ptr<StagedCreate>> TLocalStorageBackend::PrepareCreate(const 
 Status TLocalStorageBackend::CheckAppendAdmissible(const StoreInfo& store,
     const CollectionInfo& collection,
     const BaseIdentity& base,
-    const NormalizedInput& input)
+    NormalizedInput& input)
 {
     return Guarded<Status>([&]() -> Status {
         CheckStore(store);
@@ -578,6 +590,12 @@ Status TLocalStorageBackend::CheckAppendAdmissible(const StoreInfo& store,
         CheckUsage(NStorage::CheckStorageCapacity(minUsage, Options_.Storage),
             "RESOURCE_EXHAUSTED",
             "storage capacity");
+        auto batch = MakeRecordBatch(collection.schema, input.rows, Options_.InputPool.get());
+        if (!batch) {
+            throw Failure(batch.error());
+        }
+        auto owner = std::make_shared<TAdmittedBatch>(Options_.InputPool, std::move(*batch));
+        input.writer_batch = std::shared_ptr<arrow::RecordBatch>(owner, owner->Batch.get());
         return {};
     });
 }
@@ -610,18 +628,15 @@ Result<std::unique_ptr<StagedAppend>> TLocalStorageBackend::PrepareAppend(const 
             EStoragePath::Write,
             "create attempt");
         auto scope = TakeIceberg(FileIO_->BindAttempt(attempt), "IO_ERROR", "bind append attempt");
-        auto batch = MakeRecordBatch(collection.schema, input.rows);
-        if (!batch) {
-            throw Failure(batch.error());
-        }
+        Require(input.writer_batch != nullptr, "INTERNAL", "append input was not admitted");
 
         const auto location = TableLocation(Store_.store_id, binding.collection_id);
         const auto dataPath =
             std::format("{}/data/{}-{}-00000.parquet", location, binding.operation_id, binding.attempt_id);
-        const auto data =
-            TakeIceberg(NStorage::WriteDataFile(FileIO_, attempt, *base->Metadata, dataPath, {*batch}, Options_.Writer),
-                "IO_ERROR",
-                "write data file");
+        const auto data = TakeIceberg(
+            NStorage::WriteDataFile(FileIO_, attempt, *base->Metadata, dataPath, {input.writer_batch}, Options_.Writer),
+            "IO_ERROR",
+            "write data file");
         Require(data.DataFile != nullptr && data.DataFile->record_count == static_cast<int64_t>(input.rows.size()),
             "IO_ERROR",
             "data file does not contain every input row");
@@ -784,8 +799,8 @@ Status TLocalStorageBackend::VerifyRetained(const StoreInfo& store,
                     view.base.current_snapshot_id == view.info.current_snapshot_id,
                 "CORRUPTION",
                 "collection view identity is inconsistent");
-            // The full reachable closure on open and Reconcile. Idempotent
-            // retries use VerifyCommittedAppend for their own snapshot.
+            // The full reachable closure on open and Reconcile; terminal
+            // receipt lookups reuse this verified generation.
             auto state = VerifyCollection(view.base);
             CheckSchema(*state->Metadata, view.info.schema);
             CheckHistory(*state->Metadata, view.info.collection_id, operations);
@@ -831,42 +846,6 @@ void TLocalStorageBackend::RetireRoot(const BaseIdentity& superseded)
     }
     // Best effort: a root that cannot be removed stays as an orphan file.
     [[maybe_unused]] const auto error = Dirs_->RemoveMetadataFile(uri.Value());
-}
-
-Status TLocalStorageBackend::VerifyCommittedAppend(const StoreInfo& store,
-    const CollectionView& collection,
-    std::span<const OperationRecord>,
-    const AppendResult& receipt)
-{
-    return Guarded<Status>([&]() -> Status {
-        CheckStore(store);
-        const auto& base = collection.base;
-        Require(base.collection_id == collection.info.collection_id && base.table_uuid == collection.info.table_uuid &&
-                base.current_snapshot_id == collection.info.current_snapshot_id &&
-                receipt.collection_id == collection.info.collection_id,
-            "CORRUPTION",
-            "collection view identity is inconsistent");
-        const std::shared_ptr<iceberg::FileIO> view =
-            TakeIceberg(FileIO_->ReadOnlyView(), "IO_ERROR", "open read-only FileIO");
-        // A retry must not return a committed outcome over missing or corrupt
-        // files: check the receipt's own snapshot closure in the current root.
-        const auto state = TakeRetained(NStorage::VerifyRetainedSnapshot(view,
-                                            base.metadata_location,
-                                            Store_.store_id,
-                                            base.collection_id,
-                                            receipt.snapshot_id,
-                                            Options_.Storage),
-            "verify committed snapshot");
-        CheckIdentity(state, base);
-        CheckSchema(*state.Metadata, collection.info.schema);
-        const auto snapshot = TakeRetained(state.Metadata->SnapshotById(receipt.snapshot_id), "committed snapshot");
-        const auto operation = snapshot->summary.find(std::string(OperationKey));
-        Require(operation != snapshot->summary.end() && operation->second == receipt.operation_id,
-            "CORRUPTION",
-            "retained snapshot has another operation identity");
-        CheckReceipt(*snapshot, receipt);
-        return {};
-    });
 }
 
 Result<std::shared_ptr<iceberg::FileIO>> TLocalStorageBackend::ReadOnlyFileIO()

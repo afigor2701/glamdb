@@ -222,6 +222,12 @@ journal makes the run INCOMPLETE; automatic job recovery is not implemented.
 
 ## Tests
 
+Long-running capacity and concurrent-session campaigns are separate, opt-in
+tests in [tests/stress](../../tests/stress/README.md). Run them explicitly with
+`python tests/stress/run.py --profile capacity --output artifacts/stress-run-01`
+from the repository root. They are excluded from default pytest/CTest discovery
+and CI; the short checks below retain their current CI behavior.
+
 ```sh
 bash scripts/check-workload.sh unit
 GLAMDB_CLI="$PWD/build/client/glamdb-cli" GLAMDB_NATIVE_SERVER="$PWD/build/local/apps/server/glamdb" bash scripts/check-workload.sh

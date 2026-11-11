@@ -246,6 +246,9 @@ public:
             return ReadNext();
         } catch (const Failure& error) {
             Release();
+            if (State_ == ScanState::Open) {
+                State_ = error.detail.code == "CANCELLED" ? ScanState::Cancelled : ScanState::Failed;
+            }
             if (Context_.OnError) {
                 Context_.OnError(error.detail);
             }
@@ -255,10 +258,16 @@ public:
             return std::unexpected(error.detail);
         } catch (const std::bad_alloc& error) {
             Release();
+            if (State_ == ScanState::Open) {
+                State_ = ScanState::Failed;
+            }
             Failed_ = ErrorDetail{"RESOURCE_EXHAUSTED", BoundedDiagnostic(error.what()), RetryHint::OperatorAction};
             return std::unexpected(*Failed_);
         } catch (const std::exception& error) {
             Release();
+            if (State_ == ScanState::Open) {
+                State_ = ScanState::Failed;
+            }
             Failed_ = ErrorDetail{"INTERNAL", BoundedDiagnostic(error.what()), RetryHint::OperatorAction};
             return std::unexpected(*Failed_);
         }
@@ -267,6 +276,21 @@ public:
     void Cancel() override
     {
         Cancelled_ = true;
+    }
+
+    ScanProfile Profile() const override
+    {
+        std::lock_guard lock(Mutex_);
+        ScanProfile profile{.state = State_,
+            .manifests_read = {ManifestsRead_, MetricKind::Measured},
+            .data_files_read = {DataFilesRead_, MetricKind::Measured},
+            .data_bytes_read = {DataBytesRead_, MetricKind::Measured},
+            .rows_decoded = {RowsDecoded_, MetricKind::Measured},
+            .rows_returned = {RowsReturned_, MetricKind::Measured}};
+        if (profile.state == ScanState::Open && (Cancelled_.load() || (Context_.Closing && Context_.Closing->load()))) {
+            profile.state = ScanState::Cancelled;
+        }
+        return profile;
     }
 
 private:
@@ -283,7 +307,13 @@ private:
     const std::vector<size_t> ReadFields_;
     const int64_t BatchRows_;
 
-    std::mutex Mutex_;
+    mutable std::mutex Mutex_;
+    ScanState State_ = ScanState::Open;
+    int64_t ManifestsRead_ = 0;
+    int64_t DataFilesRead_ = 0;
+    int64_t DataBytesRead_ = 0;
+    int64_t RowsDecoded_ = 0;
+    int64_t RowsReturned_ = 0;
     std::atomic<bool> Cancelled_{false};
     std::optional<ErrorDetail> Failed_;
     size_t NextManifest_ = 0;
@@ -319,6 +349,7 @@ private:
                 while (PendingFiles_.empty() && NextManifest_ < Plan_.Manifests.size()) {
                     CheckActive();
                     auto files = Take(ManifestFiles(Context_.FileIO, Plan_, NextManifest_++));
+                    ++ManifestsRead_;
                     PendingFiles_.insert(PendingFiles_.end(),
                         std::make_move_iterator(files.begin()),
                         std::make_move_iterator(files.end()));
@@ -338,13 +369,16 @@ private:
                 Release();
                 continue;
             }
+            RowsDecoded_ += batch->num_rows();
             if (auto produced = Produce(*batch)) {
                 CheckActive();
+                RowsReturned_ += produced->num_rows();
                 return produced;
             }
         }
         Release();
         CheckActive();
+        State_ = ScanState::Complete;
         return std::shared_ptr<arrow::RecordBatch>{};
     }
 
@@ -354,6 +388,8 @@ private:
         auto bytes = TakeIceberg(Context_.FileIO->ReadFile(file.Path, static_cast<size_t>(file.SizeBytes)),
             "IO_ERROR",
             "read data file");
+        ++DataFilesRead_;
+        DataBytesRead_ += static_cast<int64_t>(bytes.size());
         if (static_cast<int64_t>(bytes.size()) != file.SizeBytes) {
             Fail("CORRUPTION", "read data file", "file length differs from its manifest");
         }

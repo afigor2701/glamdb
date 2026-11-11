@@ -8,6 +8,7 @@
 
 namespace arrow {
 class DataType;
+class MemoryPool;
 class RecordBatch;
 class Schema;
 } // namespace arrow
@@ -24,7 +25,8 @@ std::shared_ptr<arrow::Schema> MakeArrowSchema(const SchemaSpec& schema);
 
 // Builds one owned, immutable batch from normalized rows. Values must already
 // satisfy the schema; a mismatch is an internal error, not a cast.
-Result<std::shared_ptr<arrow::RecordBatch>> MakeRecordBatch(const SchemaSpec& schema, const std::vector<Row>& rows);
+Result<std::shared_ptr<arrow::RecordBatch>>
+MakeRecordBatch(const SchemaSpec& schema, const std::vector<Row>& rows, arrow::MemoryPool* pool = nullptr);
 
 // Upper bound of arrow::util::TotalBufferSize(*MakeRecordBatch(schema, rows))
 // computed without building the batch: every column is counted with a

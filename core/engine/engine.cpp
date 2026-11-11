@@ -9,6 +9,8 @@
 
 #if GLAMDB_HAS_STORAGE
 #include "core/backend/local_storage_backend.h"
+#include "core/scan/file_metadata.h"
+#include "core/scan/metadata.h"
 #include "core/scan/scan_cursor.h"
 #endif
 
@@ -16,6 +18,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <new>
 #include <optional>
 #include <string>
 #include <utility>
@@ -39,7 +42,9 @@ T Take(Result<T> result)
 
 ErrorDetail ExceptionError(const std::exception& error)
 {
-    return {"INTERNAL", BoundedDiagnostic(error.what()), RetryHint::OperatorAction};
+    return {dynamic_cast<const std::bad_alloc*>(&error) != nullptr ? "RESOURCE_EXHAUSTED" : "INTERNAL",
+        BoundedDiagnostic(error.what()),
+        RetryHint::OperatorAction};
 }
 
 AppendOutcome Rejected(std::string operation_id, CommitPhase phase, ErrorDetail error)
@@ -438,6 +443,53 @@ struct Engine::Impl
         }
     }
 
+#if GLAMDB_HAS_STORAGE
+    template <class T, class TRead>
+    Result<T> ReadView(std::string_view id, TRead&& read)
+    {
+        std::string root;
+        bool leased = false;
+        const auto release = [&] {
+            if (std::exchange(leased, false)) {
+                ReleaseRoot(root);
+            }
+        };
+        try {
+            Require(ValidUuid(id), "INVALID_ARGUMENT", "metadata requires a canonical collection UUID");
+            TScanContext context;
+            {
+                std::lock_guard lock(state_mutex);
+                CheckReady();
+                context.Collection = CachedCollection(id);
+                const auto view = std::ranges::find_if(confirmed_views, [&](const auto& item) {
+                    return item.info.collection_id == id;
+                });
+                Require(view != confirmed_views.end(), "CORRUPTION", "confirmed collection view is missing");
+                context.Base = view->base;
+                root = context.Base.metadata_location;
+                ++root_readers[root];
+                leased = true;
+            }
+            Require(backend != nullptr, "DEPENDENCY_UNAVAILABLE", "storage reader is not installed");
+            context.FileIO = Take(backend->ReadOnlyFileIO());
+            auto result = read(context);
+            release();
+            return result;
+        } catch (const Failure& error) {
+            release();
+            CloseOnCorruption(error.detail);
+            return std::unexpected(error.detail);
+        } catch (const std::bad_alloc& error) {
+            release();
+            return std::unexpected(
+                ErrorDetail{"RESOURCE_EXHAUSTED", BoundedDiagnostic(error.what()), RetryHint::OperatorAction});
+        } catch (const std::exception& error) {
+            release();
+            return std::unexpected(ExceptionError(error));
+        }
+    }
+#endif
+
     void RefreshCache()
     {
         auto current = catalog->Collections();
@@ -480,37 +532,6 @@ struct Engine::Impl
                 if (!verified) {
                     throw Failure(verified.error());
                 }
-            }
-        } catch (...) {
-            if (backend) {
-                backend->InvalidateCache();
-            }
-            std::lock_guard lock(state_mutex);
-            ready = false;
-            ++health_generation;
-            throw;
-        }
-    }
-
-    void VerifyCommittedRetry(const AppendOutcome& outcome)
-    {
-        try {
-            if (!outcome.result) {
-                throw Failure({"CORRUPTION", "committed operation has no receipt", RetryHint::OperatorAction});
-            }
-            const auto& result = *outcome.result;
-            const auto& collection_id = result.collection_id;
-            const CollectionView view{catalog->Collection(collection_id), catalog->Base(collection_id)};
-            std::vector<OperationRecord> operations;
-            for (auto& record : catalog->Operations()) {
-                if (record.binding.collection_id == collection_id) {
-                    operations.push_back(std::move(record));
-                }
-            }
-            Require(backend != nullptr, "DEPENDENCY_UNAVAILABLE", "storage recovery validator is not installed");
-            const auto verified = backend->VerifyCommittedAppend(info, view, operations, result);
-            if (!verified) {
-                throw Failure(verified.error());
             }
         } catch (...) {
             if (backend) {
@@ -1117,11 +1138,13 @@ AppendOutcome Engine::AppendDurable(const AppendRequest& request)
                 "operation ID is permanently bound to different content");
             if (previous->outcome) {
                 try {
-                    // A failed outcome references no storage; a committed one
-                    // re-checks only its own collection and snapshot.
-                    if (previous->outcome->disposition == CommitDisposition::Committed) {
-                        impl->VerifyCommittedRetry(*previous->outcome);
-                    }
+                    // Startup/recovery verified the retained history; confirmed
+                    // publications preserve it. A terminal lookup is not a scrub.
+                    std::lock_guard state_lock(impl->state_mutex);
+                    impl->CheckReady();
+                    Require(impl->health_generation == expected_generation,
+                        "RECOVERY_REQUIRED",
+                        "authoritative reconciliation is required");
                 } catch (const Failure& error) {
                     return impl->Unknown(Context(previous->binding, error.detail, true),
                         CommitPhase::Reconciling,
@@ -1149,7 +1172,7 @@ AppendOutcome Engine::AppendDurable(const AppendRequest& request)
             impl->owned_input_bytes += reservation;
             admission.bytes = reservation;
         }
-        const auto input = Take(NormalizeBatches(collection.schema, request.collection_id, request.batches));
+        auto input = Take(NormalizeBatches(collection.schema, request.collection_id, request.batches));
         Require(input.payload_hash == payload_hash, "INVALID_ARGUMENT", "Arrow input changed during append");
         const auto base = impl->catalog->Base(request.collection_id);
         if (impl->backend) {
@@ -1325,7 +1348,9 @@ Result<std::optional<AppendOutcome>> Engine::FindAppendOutcome(std::string_view 
                 "OPERATION_IN_PROGRESS",
                 "registered append is still executing");
         }
-        const auto record = impl->catalog->FindOperation(collection_id, operation_id);
+        // Publication owns the catalog lock through durable file work. Outcome
+        // lookup must leave the service's control workers available meanwhile.
+        const auto record = impl->catalog->TryFindOperation(collection_id, operation_id);
         {
             std::lock_guard lock(impl->state_mutex);
             impl->CheckReady();
@@ -1339,6 +1364,93 @@ Result<std::optional<AppendOutcome>> Engine::FindAppendOutcome(std::string_view 
         impl->CloseOnCorruption(error.detail);
         return std::unexpected(error.detail);
     }
+}
+
+EngineCapabilities Engine::GetCapabilities() const
+{
+    return impl_->backend ? impl_->backend->GetCapabilities() : EngineCapabilities{};
+}
+
+Result<SnapshotHistory> Engine::ListSnapshots(std::string_view id) const
+{
+    const auto impl = impl_;
+#if GLAMDB_HAS_STORAGE
+    return impl->ReadView<SnapshotHistory>(id, [&](const TScanContext& context) {
+        std::vector<AppendResult> receipts;
+        for (const auto& record : impl->catalog->Operations()) {
+            if (record.state == OperationState::Committed && record.outcome && record.outcome->result) {
+                receipts.push_back(*record.outcome->result);
+            }
+        }
+        return ReadHistory(context, receipts);
+    });
+#else
+    (void)id;
+    return std::unexpected(
+        ErrorDetail{"DEPENDENCY_UNAVAILABLE", "storage metadata is not built", RetryHint::OperatorAction});
+#endif
+}
+
+Result<CollectionStatistics> Engine::GetStatistics(std::string_view id, SnapshotSelector selector) const
+{
+    const auto impl = impl_;
+#if GLAMDB_HAS_STORAGE
+    return impl->ReadView<CollectionStatistics>(id, [&](const TScanContext& context) {
+        return ReadStatistics(context, selector);
+    });
+#else
+    (void)id;
+    (void)selector;
+    return std::unexpected(
+        ErrorDetail{"DEPENDENCY_UNAVAILABLE", "storage metadata is not built", RetryHint::OperatorAction});
+#endif
+}
+
+Result<TFileListing> Engine::ListFiles(std::string_view collectionID, SnapshotSelector selector) const
+{
+#if GLAMDB_HAS_STORAGE
+    return impl_->ReadView<TFileListing>(collectionID, [&](const TScanContext& context) {
+        return ReadFiles(context, selector);
+    });
+#else
+    (void)collectionID;
+    (void)selector;
+    return std::unexpected(
+        ErrorDetail{"DEPENDENCY_UNAVAILABLE", "storage metadata is not built", RetryHint::OperatorAction});
+#endif
+}
+
+// The IDs have distinct validated UUID and SHA-256 formats.
+// NOLINTBEGIN(bugprone-easily-swappable-parameters)
+Result<TFileDetails>
+Engine::GetFileDetails(std::string_view collectionID, std::string_view fileID, SnapshotSelector selector) const
+{
+#if GLAMDB_HAS_STORAGE
+    return impl_->ReadView<TFileDetails>(collectionID, [&](const TScanContext& context) {
+        return ReadFileDetails(context, fileID, selector);
+    });
+#else
+    (void)collectionID;
+    (void)fileID;
+    (void)selector;
+    return std::unexpected(
+        ErrorDetail{"DEPENDENCY_UNAVAILABLE", "storage metadata is not built", RetryHint::OperatorAction});
+#endif
+}
+// NOLINTEND(bugprone-easily-swappable-parameters)
+
+Result<ScanExplanation> Engine::ExplainScan(const ScanRequest& request) const
+{
+    const auto impl = impl_;
+#if GLAMDB_HAS_STORAGE
+    return impl->ReadView<ScanExplanation>(request.collection_id, [&](const TScanContext& context) {
+        return detail::ExplainScan(context, request);
+    });
+#else
+    (void)request;
+    return std::unexpected(
+        ErrorDetail{"DEPENDENCY_UNAVAILABLE", "storage metadata is not built", RetryHint::OperatorAction});
+#endif
 }
 
 Result<std::shared_ptr<ScanCursor>> Engine::Scan(const ScanRequest& request) const

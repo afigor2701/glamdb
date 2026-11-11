@@ -28,6 +28,8 @@ see [SCANNER.md](docs/development/SCANNER.md).
 The [installed public API consumer](docs/development/BUILDING.md#build-and-install)
 checks real A/B appends, fixed-view scans, persisted receipts and retries after
 reopening in a new process, with a separate storage-disabled contour.
+Healthy terminal receipt lookups reuse the verified generation without rereading
+warehouse history; observed corruption and uncertainty still require recovery.
 See the [coordinator guide](docs/development/COORDINATOR.md)
 and [storage guide](docs/development/STORAGE_MODULE.md) for supported boundaries.
 The [shared resource budget matrix](docs/development/RESOURCE_BUDGETS.md) names
@@ -46,6 +48,11 @@ create/append/scan operations, JSON and Arrow, with explicit capabilities for
 unavailable metadata/explain APIs. A separate **disposable in-memory mock**
 remains available for development. Its data files,
 snapshots and commits are synthetic and disappear on restart.
+
+The embedded C++ facade also exposes [native metadata](docs/development/METADATA.md):
+capabilities, receipt-backed snapshot history, selected-view statistics,
+snapshot-bound file and row-group details, scan explain and execution profiles.
+HTTP metadata/explain adapters remain pending.
 
 The workbench also has a **public browser demo** requiring no token or Python
 server. Each page instance owns its sample data; visitors can create/append,

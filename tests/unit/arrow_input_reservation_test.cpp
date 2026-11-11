@@ -3,6 +3,7 @@
 // standard library.
 
 #include "core/api/canonical.h"
+#include "core/engine/storage_mapping.h"
 
 #include <arrow/api.h>
 #include <gtest/gtest.h>
@@ -27,6 +28,30 @@ std::shared_ptr<arrow::Array> Strings(int64_t rows, size_t length, char fill)
     std::shared_ptr<arrow::Array> array;
     EXPECT_TRUE(builder.Finish(&array).ok());
     return array;
+}
+
+TEST(ArrowInputReservation, NullHeavyReservationCoversOwnedRowsAndWriterAllocation)
+{
+    SchemaSpec schema;
+    for (int column = 0; column < 64; ++column) {
+        schema.fields.push_back({"n" + std::to_string(column), FieldType::Int64, true});
+    }
+    const auto batch = arrow::RecordBatch::Make(arrow::schema({}), 10000, std::vector<std::shared_ptr<arrow::Array>>{});
+    const auto reservation = InputReservation(schema, {batch});
+    ASSERT_TRUE(reservation);
+    const auto normalized = NormalizeBatches(schema, "00112233-4455-6677-8899-aabbccddeeff", {batch});
+    ASSERT_TRUE(normalized);
+    arrow::ProxyMemoryPool pool(arrow::default_memory_pool());
+    const auto writerBatch = MakeRecordBatch(schema, normalized->rows, &pool);
+    ASSERT_TRUE(writerBatch);
+    size_t ownedBytes = normalized->rows.capacity() * sizeof(Row);
+    for (const auto& row : normalized->rows) {
+        ownedBytes += row.capacity() * sizeof(Cell);
+    }
+    // The reservation must at least cover these simultaneous live allocations;
+    // the canonical NULL encoding alone does not measure the writer's slots.
+    EXPECT_GE(*reservation, ownedBytes + static_cast<size_t>(pool.max_memory()));
+    EXPECT_LE(*reservation, static_cast<size_t>(Limits{}.max_owned_input_bytes));
 }
 
 TEST(ArrowInputReservation, MaximumWideAppendFitsTheDefaultOwnedInputBudget)

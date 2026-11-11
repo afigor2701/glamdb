@@ -59,14 +59,15 @@ does not qualify physical power-loss durability.
   footers), its schema, a one-to-one mapping between retained snapshots and
   committed receipts, and the aggregate multi-collection store usage against
   `TStorageLimits::Store`. It runs on open, `Reconcile()` and every identical
-  create retry. An idempotent retry of a committed append runs
-  `VerifyCommittedAppend` instead: the collection's committed root, the
-  receipt's snapshot (its transition from the parent, manifest list, new
-  manifest and Parquet footer) and the receipt fields, so the retry never
-  returns a committed outcome over missing or corrupt files of that append
-  without re-reading unrelated history. A retry of a failed outcome reads no
-  storage. Missing or inconsistent committed state is `CORRUPTION`, which
-  closes readiness.
+  create retry. Healthy append retries and `FindAppendOutcome` use direct catalog
+  lookups within the verified generation, without enumerating operation history
+  or rereading warehouse files. Confirmed publications preserve that generation;
+  observed corruption and uncertain publication invalidate it. Receipt lookup
+  does not scrub for unobserved file damage. A scan or explicit `Reconcile()`
+  detects damage; missing or inconsistent committed state is `CORRUPTION` and
+  closes readiness. Full recovery verification and a successful durability fence
+  are required before terminal lookups resume. A durable write latch alone still
+  permits old receipt lookup.
 - After a committed append the backend removes the superseded root
   (`RetireRoot`). The engine defers it while a scan that resolved that root is
   still planning; a root that cannot be removed remains an orphan. Removal
@@ -87,7 +88,11 @@ writer row/byte limits (1..10000 rows, 2 MiB per row including fixed slot
 headers for `NULL` cells, 16 MiB Arrow buffers, estimated without building a
 batch), the warehouse preflight, the exact base root against
 `TStorageLimits::RootBytes` and `MetadataLogEntries`, and the minimum store
-usage increment of one append. Exactly one Arrow batch is built per append.
+usage increment of one append. After these checks it allocates exactly one
+normalized Arrow batch before binding and retains it in the call-owned input;
+`PrepareAppend` reuses that batch. Allocation refusal is `RESOURCE_EXHAUSTED`
+with `OperatorAction`, consumes no ID and releases partial buffers. The owned-input
+reservation remains charged until the call and its batch finish.
 Limits that only the produced files reveal (`MaxFileBytes`, candidate root
 size, aggregate usage) fail after binding as `RESOURCE_EXHAUSTED` with
 `OperatorAction`; the ID stays permanently failed. The default storage limits
@@ -129,6 +134,11 @@ An `invalid_argument` from a `statfs` anomaly in the preflight is not
 distinguishable from a planted special file and also fails closed.
 
 ## Scan path
+
+The facade also exposes capabilities, retained snapshot history, selected-view
+statistics, snapshot-bound file/row-group details and scan explain. Cursor profiles
+measure completed execution work.
+See [public metadata](METADATA.md) for provenance, unknown counters and limits.
 
 `Engine::Scan` validates the collection, resolves the confirmed SQLite view
 once, and opens a cursor through the backend's read-only FileIO view; it never

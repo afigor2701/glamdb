@@ -113,6 +113,7 @@ struct TScans::TImpl
         std::atomic<bool> Cancelled{false}, Complete{false};
         const int64_t Created = Now();
         std::atomic<int64_t> Touched{Created};
+        // LLVM 18 supports the C++23 shared_ptr atomic free functions.
         std::shared_ptr<ScanCursor> Cursor;
         std::deque<std::shared_ptr<arrow::RecordBatch>> Pending;
         ScanInfo Info;
@@ -121,8 +122,8 @@ struct TScans::TImpl
         size_t ChargedBytes = 0;
         ~TSession()
         {
-            if (Cursor) {
-                Cursor->Cancel();
+            if (const auto cursor = std::atomic_load(&Cursor)) {
+                cursor->Cancel();
             }
         }
     };
@@ -131,7 +132,7 @@ struct TScans::TImpl
     // response copying or waiting for a session mutex.
     std::mutex Mutex;
     std::condition_variable Wake;
-    bool Stopping = false;
+    bool Stopping = false, Accepting = true;
     size_t ReplayBytes = 0;
     std::vector<TPtr> Sessions;
     std::unordered_map<std::string, TPtr> Tokens;
@@ -204,9 +205,8 @@ struct TScans::TImpl
     void Release(const TPtr& session)
     {
         session->Cancelled = true;
-        if (session->Cursor) {
-            session->Cursor->Cancel();
-            session->Cursor.reset();
+        if (const auto cursor = std::atomic_exchange(&session->Cursor, std::shared_ptr<ScanCursor>{})) {
+            cursor->Cancel();
         }
         session->Pending.clear();
         session->Replay = {};
@@ -300,6 +300,7 @@ struct TScans::TImpl
             EvictCompleted(&session->Database);
         }
         std::lock_guard lock(Mutex);
+        Require(Accepting, "server is stopping", "CANCELLED");
         const auto localCount = std::count_if(Sessions.begin(), Sessions.end(), [&](const auto& item) {
             return item->Database == session->Database;
         });
@@ -330,8 +331,9 @@ struct TScans::TImpl
     {
         CheckActive(session);
         while (session.Pending.empty() && !session.Ended) {
-            auto batch = Unwrap(session.Cursor->Next());
+            auto result = std::atomic_load(&session.Cursor)->Next();
             CheckActive(session);
+            auto batch = Unwrap(std::move(result));
             if (!batch) {
                 session.Ended = true;
             } else if (batch->num_rows() != 0) {
@@ -483,15 +485,16 @@ struct TScans::TImpl
             response = {200, std::move(body)};
         }
         Require(response.Body.size() <= MaxResponseBytes, "scan response exceeds response byte limit");
-        Charge(session, response.Body.size());
         session->Replay = response;
+        Charge(session, session->Replay.Body.size());
         CheckActive(*session);
         session->ReplayToken = token;
         session->NextToken = next;
         session->Touched = Now();
         if (next.empty()) {
-            session->Cursor->Cancel();
-            session->Cursor.reset();
+            if (const auto cursor = std::atomic_exchange(&session->Cursor, std::shared_ptr<ScanCursor>{})) {
+                cursor->Cancel();
+            }
             session->Complete = true;
         }
         {
@@ -546,8 +549,13 @@ TResponse TScans::Open(const std::shared_ptr<Engine>& engine,
         if (!body.contains("cursor")) {
             Impl_->Register(session);
             const auto info = Unwrap(engine->GetCollection(collection));
-            session->Cursor = Unwrap(engine->Scan(ParseScan(collection, info.schema, body)));
-            session->Info = session->Cursor->Info();
+            const auto cursor = Unwrap(engine->Scan(ParseScan(collection, info.schema, body)));
+            std::atomic_store(&session->Cursor, cursor);
+            // Stop may have run while planning, before the cursor was published.
+            if (session->Cancelled.load()) {
+                cursor->Cancel();
+            }
+            session->Info = cursor->Info();
             session->Schema = EncodeSchema(*session->Info.output_schema);
             for (auto& field : session->Schema["fields"]) {
                 for (size_t i = 0; i < info.schema.fields.size(); ++i) {
@@ -566,6 +574,24 @@ TResponse TScans::Open(const std::shared_ptr<Engine>& engine,
                     {"identity", EncodeIdentity(session->Info.identity)}}
                     .dump()};
         }
+    } catch (...) {
+        Impl_->Release(session);
+        throw;
+    }
+    // Reserve before cursor I/O or row consumption. Keep the previous replay
+    // charged while its replacement is encoded; a refused existing cursor
+    // must retain both tokens and the exact previous response.
+    try {
+        if (token != session->ReplayToken) {
+            Impl_->Charge(session, session->Replay.Body.size() + MaxResponseBytes);
+        }
+    } catch (...) {
+        if (!body.contains("cursor")) {
+            Impl_->Release(session);
+        }
+        throw;
+    }
+    try {
         return Impl_->Page(session, token);
     } catch (...) {
         Impl_->Release(session);
@@ -587,6 +613,25 @@ TResponse TScans::Cancel(const std::string& database, const std::string& collect
         Impl_->Release(session);
     }
     return {200, R"({"cancelled":true})"};
+}
+void TScans::Stop()
+{
+    std::array<TImpl::TPtr, MaxSessions> sessions;
+    size_t count = 0;
+    {
+        std::lock_guard lock(Impl_->Mutex);
+        Impl_->Accepting = false;
+        for (const auto& session : Impl_->Sessions) {
+            Impl_->MarkLocked(session);
+            sessions[count++] = session;
+        }
+    }
+    // Cursor cancellation is thread-safe; destruction stays outside registry locks.
+    for (size_t index = 0; index < count; ++index) {
+        if (const auto cursor = std::atomic_load(&sessions[index]->Cursor)) {
+            cursor->Cancel();
+        }
+    }
 }
 void TScans::Clear(const std::string& database)
 {

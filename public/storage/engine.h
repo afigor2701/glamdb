@@ -1,5 +1,6 @@
 #pragma once
 
+#include "storage/metadata.h"
 #include "storage/scan.h"
 #include "storage/types.h"
 
@@ -27,6 +28,18 @@ public:
     const StoreInfo& GetStoreInfo() const;
     // No catalog/file I/O and no writer wait; remains callable during recovery/shutdown.
     StoreHealth GetHealth() const;
+    EngineCapabilities GetCapabilities() const;
+    Result<SnapshotHistory> ListSnapshots(std::string_view collection_id) const;
+    Result<CollectionStatistics> GetStatistics(std::string_view collection_id,
+        SnapshotSelector selector = SnapshotSelector::Latest()) const;
+    Result<TFileListing> ListFiles(std::string_view collectionID,
+        SnapshotSelector selector = SnapshotSelector::Latest()) const;
+    // Only opaque IDs returned by ListFiles; membership is checked before file I/O.
+    Result<TFileDetails> GetFileDetails(std::string_view collectionID,
+        std::string_view fileID,
+        SnapshotSelector selector = SnapshotSelector::Latest()) const;
+    // Plans and validates one fixed view without reading Parquet data.
+    Result<ScanExplanation> ExplainScan(const ScanRequest& request) const;
     CreateOutcome CreateCollection(const CreateCollectionRequest& request);
     Result<CollectionInfo> GetCollection(std::string_view collection_id) const;
     Result<CollectionInfo> ResolveCollection(std::string_view exact_name) const;

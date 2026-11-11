@@ -69,6 +69,7 @@ struct Shape
 {
     size_t rows = 0;
     size_t decoded_bytes = 0;
+    size_t null_slot_bytes = 0;
 };
 
 // Boxes each mapped column once per batch: RecordBatch::column() locks and
@@ -104,6 +105,8 @@ Shape Inspect(const SchemaSpec& schema, const std::vector<std::shared_ptr<arrow:
                 const auto* array = arrays[field].get();
                 if (array == nullptr || array->IsNull(row)) {
                     Require(schema.fields[field].nullable, "INVALID_ARGUMENT", "NULL in required Arrow field");
+                    const auto type = schema.fields[field].type;
+                    shape.null_slot_bytes += type == FieldType::String ? 4 : type == FieldType::Bool ? 1 : 8;
                     continue;
                 }
                 if (schema.fields[field].type == FieldType::String) {
@@ -158,8 +161,10 @@ Result<size_t> InputReservation(const SchemaSpec& schema,
         // the Arrow batch with builder growth (4 copies). STL cells, including
         // tiny/null values whose buffers alone undercount RAM, exist once;
         // row headers twice while the extracted rows are moved into the
-        // normalized input.
-        return shape.decoded_bytes * 4 + shape.rows * (sizeof(Row) * 2 + schema.fields.size() * sizeof(Cell)) + 65536;
+        // normalized input. NULL encodings omit typed slots, but Arrow still
+        // allocates them; reserve their builder growth separately.
+        return shape.decoded_bytes * 4 + shape.null_slot_bytes * 2 +
+            shape.rows * (sizeof(Row) * 2 + schema.fields.size() * sizeof(Cell)) + 65536;
     } catch (const Failure& error) {
         auto detail = error.detail;
         detail.retry_hint = RetryHint::FixInput;

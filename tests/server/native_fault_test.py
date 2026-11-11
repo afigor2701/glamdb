@@ -37,8 +37,8 @@ class NativeFaultHTTP(unittest.TestCase):
         self.assertTrue(line, 'fault server did not report its address')
         self.port = json.loads(line)['port']
 
-    def stop(self):
-        if self.process.poll() is None:
+    def stop(self, *, terminate=True):
+        if terminate and self.process.poll() is None:
             self.process.terminate()
         out, err = self.process.communicate(timeout=20)
         self.assertEqual(self.process.returncode, 0, out + err)
@@ -54,6 +54,12 @@ class NativeFaultHTTP(unittest.TestCase):
         self.process.stdin.flush()
         self.assertTrue(select.select([self.process.stdout], [], [], 12)[0])
         self.assertEqual(self.process.stdout.readline().strip(), 'paused')
+
+    def control(self, command):
+        self.process.stdin.write(command + '\n')
+        self.process.stdin.flush()
+        self.assertTrue(select.select([self.process.stdout], [], [], 10)[0], 'control timed out')
+        return self.process.stdout.readline().strip()
 
     def request(self, path, body=None):
         connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=15)
@@ -227,8 +233,17 @@ class NativeFaultHTTP(unittest.TestCase):
                     pending.result(timeout=10)
                 self.assertTrue(self.api(self.base + '/readyz')['write_ready'])
 
-    def test_readiness_bypasses_blocked_operation_lookup_workers(self):
+    def test_outcome_lookups_do_not_starve_controls_or_other_databases(self):
         path = self.collection()
+        original = self.api(path + '/append',
+            {'operation_id': str(uuid.uuid4()), 'rows': [{'key': 'original'}]})
+        other = self.api('/databases', {'name': 'quiet'})['database_id']
+        collection = str(uuid.uuid4())
+        quiet = '/databases/' + other + '/collections/' + collection
+        self.api('/databases/' + other + '/collections', {'collection_id': collection,
+            'name': 'quiet', 'schema': {'fields': [{'name': 'key', 'type': 'string'}]}})
+        quiet_receipt = self.api(quiet + '/append',
+            {'operation_id': str(uuid.uuid4()), 'rows': [{'key': 'quiet'}]})
         self.arm('pause', 2, False)  # Pause outer publication, holding the catalog mutex.
         with ThreadPoolExecutor(max_workers=1) as workers:
             append = workers.submit(self.api, path + '/append',
@@ -236,18 +251,27 @@ class NativeFaultHTTP(unittest.TestCase):
             self.wait_for_publication()
             sockets = []
             try:
-                for _ in range(8):
+                operations = [original['operation_id']] + [str(uuid.uuid4()) for _ in range(7)]
+                for operation in operations:
                     stream = socket.create_connection(('127.0.0.1', self.port), timeout=2)
                     sockets.append(stream)
-                    stream.sendall((f'GET {path}/operations/{uuid.uuid4()} HTTP/1.1\r\n'
+                    stream.sendall((f'GET {path}/operations/{operation} HTTP/1.1\r\n'
                         f'Host: local\r\nAuthorization: Bearer {TOKEN}\r\n\r\n').encode())
-                # All lookup calls wait on the paused catalog. The health routes
-                # must respond while those workers and their queue are occupied.
-                self.assertFalse(select.select(sockets, [], [], 0.2)[0])
-                for suffix in ('/readyz', '/capabilities'):
+                # Every lookup must refuse promptly while the publication
+                # barrier remains held, including an older committed operation.
+                for stream in sockets:
+                    response = http.client.HTTPResponse(stream)
+                    response.begin()
+                    failure = json.loads(response.read())
+                    self.assertEqual(response.status, 503, failure)
+                    self.assertEqual(failure['error']['code'], 'OPERATION_IN_PROGRESS')
+                    self.assertNotIn('outcome', failure)
+                for target in ('/databases', self.base, '/databases/' + other,
+                        quiet + '/operations/' + quiet_receipt['operation_id'],
+                        self.base + '/readyz', self.base + '/capabilities'):
                     connection = http.client.HTTPConnection('127.0.0.1', self.port, timeout=1)
                     try:
-                        connection.request('GET', self.base + suffix,
+                        connection.request('GET', target,
                             headers={'Authorization': 'Bearer ' + TOKEN})
                         response = connection.getresponse()
                         self.assertEqual(response.status, 200, response.read())
@@ -258,6 +282,8 @@ class NativeFaultHTTP(unittest.TestCase):
                 for stream in sockets:
                     stream.close()
             self.assertEqual(append.result(timeout=10)['outcome'], 'committed')
+        self.assertEqual(self.api(path + '/operations/' + original['operation_id']), original)
+        self.api(path + '/operations/' + operations[-1], status=404)
 
     def test_control_acknowledgements_after_startup(self):
         # The readiness record and control replies come from different threads.
@@ -467,6 +493,57 @@ class NativeFaultHTTP(unittest.TestCase):
         saved.rename(other_root)
         self.start()
         self.assertEqual(self.api(path + '/scan', {})['rows'], [{'key': 'kept'}])
+
+    def test_shutdown_timeout_keeps_native_publication_and_ownership(self):
+        path = self.collection()
+        body = {'operation_id': str(uuid.uuid4()), 'rows': [{'key': 'admitted'}, {'key': 'admitted'}]}
+        self.assertEqual(self.control('owner ' + self.database), 'STATE_IN_USE')
+        self.arm('pause', 2, False)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            append = pool.submit(self.api, path + '/append', body)
+            try:
+                self.wait_for_publication()
+                self.assertEqual(self.control('shutdown ' + self.database), 'DEADLINE_EXCEEDED')
+                self.assertEqual(self.control('owner ' + self.database), 'STATE_IN_USE')
+                self.assertFalse(self.api(self.base + '/readyz', status=503)['write_ready'])
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=0.2)
+                except subprocess.TimeoutExpired:
+                    pass
+                else:
+                    self.fail('server exited during native publication')
+                self.assertEqual(self.control('server-state'), 'running')
+            finally:
+                self.arm('release', 0, False)
+            outcome = append.result(timeout=10)
+            self.assertEqual(outcome['outcome'], 'committed')
+            self.assertEqual(outcome['result']['rows_appended'], '2')
+        self.stop(terminate=False)
+        self.start()
+        self.assertEqual(self.api(path + '/operations/' + body['operation_id']), outcome)
+        self.assertEqual(self.api(path + '/append', body), outcome)
+        self.assertEqual(self.api(path + '/scan', {})['rows'], body['rows'])
+
+    def test_shutdown_reconciles_uncertain_native_publication_on_restart(self):
+        for graceful in (True, False):
+            with self.subTest(graceful=graceful):
+                path = self.collection()
+                body = {'operation_id': str(uuid.uuid4()), 'rows': [{'key': 'uncertain'}]}
+                self.arm('core', 2, True)
+                unknown = self.api(path + '/append', body, status=503)
+                self.assertEqual(unknown['outcome'], 'commit_unknown')
+                if graceful:
+                    self.stop()
+                else:
+                    self.process.kill()
+                    self.process.communicate(timeout=20)
+                    self.assertEqual(self.process.returncode, -9)
+                self.start()
+                outcome = self.api(path + '/operations/' + body['operation_id'])
+                self.assertEqual(outcome['outcome'], 'committed')
+                self.assertEqual(self.api(path + '/append', body), outcome)
+                self.assertEqual(self.api(path + '/scan', {})['rows'], body['rows'])
 
     def test_close_drains_native_publication_and_other_database_stays_available(self):
         path = self.collection()

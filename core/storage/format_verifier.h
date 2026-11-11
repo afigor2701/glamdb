@@ -15,6 +15,10 @@ class Schema;
 struct TableMetadata;
 }
 
+namespace parquet {
+class FileMetaData;
+}
+
 namespace NGlamDB::NStorage {
 
 struct TParquetLimits
@@ -51,6 +55,11 @@ struct TAvroContainerInfo
 };
 
 iceberg::Result<TParquetFileInfo> CheckParquet(iceberg::InputFile& file,
+    const iceberg::Schema& schema,
+    TParquetExpectation expected,
+    TParquetLimits limits = {});
+
+iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ReadParquetFooter(iceberg::InputFile& file,
     const iceberg::Schema& schema,
     TParquetExpectation expected,
     TParquetLimits limits = {});

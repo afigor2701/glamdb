@@ -372,6 +372,7 @@ void RunServer(TRoutes& routes,
         std::error_code ignored;
         acceptor.close(ignored);
         retry.cancel();
+        routes.CancelScans();
         // StopIdle can erase itself; advancing before it avoids allocating a copy.
         for (auto it = state.Sessions.begin(); it != state.Sessions.end();) {
             (*it++)->StopIdle();

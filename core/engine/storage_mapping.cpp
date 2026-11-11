@@ -37,7 +37,7 @@ NGlamDB::EFieldType ToStorageType(FieldType type)
 
 ErrorDetail ArrowError(const arrow::Status& status)
 {
-    return {"INTERNAL",
+    return {status.IsOutOfMemory() ? "RESOURCE_EXHAUSTED" : "INTERNAL",
         BoundedDiagnostic("Arrow batch construction failed: " + status.ToString()),
         RetryHint::OperatorAction};
 }
@@ -70,9 +70,9 @@ arrow::Status AppendCell(TBuilder& builder, const Cell& cell, bool& mismatch)
 
 template <class TBuilder, class TValue>
 Result<std::shared_ptr<arrow::Array>>
-BuildTypedColumn(const FieldSpec& field, const std::vector<Row>& rows, size_t column)
+BuildTypedColumn(const FieldSpec& field, const std::vector<Row>& rows, size_t column, arrow::MemoryPool* pool)
 {
-    TBuilder builder(MakeArrowType(field.type), arrow::default_memory_pool());
+    TBuilder builder(MakeArrowType(field.type), pool);
     if (const auto status = builder.Reserve(static_cast<int64_t>(rows.size())); !status.ok()) {
         return std::unexpected(ArrowError(status));
     }
@@ -97,19 +97,20 @@ BuildTypedColumn(const FieldSpec& field, const std::vector<Row>& rows, size_t co
     return array;
 }
 
-Result<std::shared_ptr<arrow::Array>> BuildColumn(const FieldSpec& field, const std::vector<Row>& rows, size_t column)
+Result<std::shared_ptr<arrow::Array>>
+BuildColumn(const FieldSpec& field, const std::vector<Row>& rows, size_t column, arrow::MemoryPool* pool)
 {
     switch (field.type) {
         case FieldType::String:
-            return BuildTypedColumn<arrow::StringBuilder, std::string>(field, rows, column);
+            return BuildTypedColumn<arrow::StringBuilder, std::string>(field, rows, column, pool);
         case FieldType::Bool:
-            return BuildTypedColumn<arrow::BooleanBuilder, bool>(field, rows, column);
+            return BuildTypedColumn<arrow::BooleanBuilder, bool>(field, rows, column, pool);
         case FieldType::Int64:
-            return BuildTypedColumn<arrow::Int64Builder, int64_t>(field, rows, column);
+            return BuildTypedColumn<arrow::Int64Builder, int64_t>(field, rows, column, pool);
         case FieldType::Float64:
-            return BuildTypedColumn<arrow::DoubleBuilder, double>(field, rows, column);
+            return BuildTypedColumn<arrow::DoubleBuilder, double>(field, rows, column, pool);
         case FieldType::TimestampUsUtc:
-            return BuildTypedColumn<arrow::TimestampBuilder, TimestampUs>(field, rows, column);
+            return BuildTypedColumn<arrow::TimestampBuilder, TimestampUs>(field, rows, column, pool);
     }
     return std::unexpected(CellMismatch(0, column));
 }
@@ -153,8 +154,12 @@ std::shared_ptr<arrow::Schema> MakeArrowSchema(const SchemaSpec& schema)
     return arrow::schema(std::move(fields));
 }
 
-Result<std::shared_ptr<arrow::RecordBatch>> MakeRecordBatch(const SchemaSpec& schema, const std::vector<Row>& rows)
+Result<std::shared_ptr<arrow::RecordBatch>>
+MakeRecordBatch(const SchemaSpec& schema, const std::vector<Row>& rows, arrow::MemoryPool* pool)
 {
+    if (pool == nullptr) {
+        pool = arrow::default_memory_pool();
+    }
     for (size_t row = 0; row < rows.size(); ++row) {
         if (rows[row].size() != schema.fields.size()) {
             return std::unexpected(CellMismatch(row, rows[row].size()));
@@ -163,7 +168,7 @@ Result<std::shared_ptr<arrow::RecordBatch>> MakeRecordBatch(const SchemaSpec& sc
     std::vector<std::shared_ptr<arrow::Array>> columns;
     columns.reserve(schema.fields.size());
     for (size_t column = 0; column < schema.fields.size(); ++column) {
-        auto array = BuildColumn(schema.fields[column], rows, column);
+        auto array = BuildColumn(schema.fields[column], rows, column, pool);
         if (!array) {
             return std::unexpected(array.error());
         }

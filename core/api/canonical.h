@@ -12,6 +12,8 @@ struct NormalizedInput
     std::vector<Row> rows;
     std::string payload_hash;
     size_t decoded_bytes = 0;
+    // Built during backend admission and retained until this append finishes.
+    std::shared_ptr<arrow::RecordBatch> writer_batch;
 };
 
 // Fingerprinting uses fixed-size state, independent of owned payload admission.

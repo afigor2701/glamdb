@@ -1,6 +1,4 @@
-// An idempotent terminal retry of collection A must not re-verify unrelated
-// collection B or its operations: a committed retry verifies its own
-// collection, a failed retry references no storage.
+// Terminal retries reuse the verified generation; only recovery verifies history.
 //
 // The DISABLED_ benchmark prints coordinator-only retry latency versus store
 // history with storage verification stubbed out; run it manually with
@@ -148,7 +146,7 @@ protected:
     }
 };
 
-TEST_F(TerminalRetryScopeTest, IdempotentRetryDoesNotReverifyUnrelatedCollections)
+TEST_F(TerminalRetryScopeTest, TerminalRetriesUseVerifiedGeneration)
 {
     const auto committed_request = Request(test::collection_id, OperationId(1));
     const auto committed = engine->AppendDurable(committed_request);
@@ -172,14 +170,46 @@ TEST_F(TerminalRetryScopeTest, IdempotentRetryDoesNotReverifyUnrelatedCollection
     EXPECT_EQ(engine->AppendDurable(committed_request), committed);
     EXPECT_EQ(engine->AppendDurable(failed_request), failed);
 
-    const auto calls = backend->TakeCalls();
-    EXPECT_LE(calls.size(), 2U);
-    for (const auto& call : calls) {
-        EXPECT_FALSE(call.collections.contains(other_collection))
-            << "terminal retry of collection A re-verified unrelated collection B";
-        EXPECT_FALSE(call.operation_collections.contains(other_collection))
-            << "terminal retry of collection A re-verified " << call.operations << " operations including B's";
-    }
+    EXPECT_TRUE(backend->TakeCalls().empty());
+
+    ASSERT_TRUE(engine->Reconcile());
+    EXPECT_EQ(backend->TakeCalls().size(), 1U);
+    EXPECT_EQ(engine->AppendDurable(committed_request), committed);
+    EXPECT_EQ(engine->AppendDurable(failed_request), failed);
+    EXPECT_TRUE(backend->TakeCalls().empty());
+}
+
+TEST_F(TerminalRetryScopeTest, TerminalLookupDoesNotDecodeUnrelatedOperationHistory)
+{
+    const auto committedRequest = Request(test::collection_id, OperationId(1));
+    const auto committed = engine->AppendDurable(committedRequest);
+    ASSERT_EQ(committed.disposition, CommitDisposition::Committed);
+    auto failedRequest = Request(test::collection_id, OperationId(2));
+    failedRequest.expected_snapshot = {SnapshotPreconditionKind::NoSnapshot, 0};
+    const auto failed = engine->AppendDurable(failedRequest);
+    ASSERT_EQ(failed.disposition, CommitDisposition::DefinitelyNotCommitted);
+    auto unrelated = Request(other_collection, OperationId(3));
+    unrelated.expected_snapshot = {SnapshotPreconditionKind::Equals, 1};
+    ASSERT_EQ(engine->AppendDurable(unrelated).disposition, CommitDisposition::DefinitelyNotCommitted);
+
+    // An unreadable unrelated row distinguishes point lookup from history decoding.
+    detail::Database database;
+    database.Open(root / "catalog.sqlite", SQLITE_OPEN_READWRITE, {});
+    database.Execute("UPDATE operations SET hash_version=2 WHERE collection_id=?", {std::string(other_collection)});
+    ASSERT_EQ(database.Changes(), 1);
+    EXPECT_EQ(engine->AppendDurable(committedRequest), committed);
+    EXPECT_EQ(engine->AppendDurable(failedRequest), failed);
+    const auto lookup = engine->FindAppendOutcome(test::collection_id, OperationId(1));
+    ASSERT_TRUE(lookup && lookup->has_value());
+    EXPECT_EQ(test::Present(*lookup), committed);
+
+    // Recovery must inspect that row and keep admission closed until it is repaired.
+    EXPECT_FALSE(engine->Reconcile());
+    EXPECT_FALSE(engine->GetHealth().write_ready);
+    database.Execute("UPDATE operations SET hash_version=1 WHERE collection_id=?", {std::string(other_collection)});
+    ASSERT_TRUE(engine->Reconcile());
+    EXPECT_EQ(engine->AppendDurable(committedRequest), committed);
+    EXPECT_EQ(engine->AppendDurable(failedRequest), failed);
 }
 
 // ---- Manual benchmark: coordinator-only terminal retry cost vs history ----

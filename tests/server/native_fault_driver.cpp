@@ -6,6 +6,7 @@
 #include <sys/resource.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstdio>
 #include <iostream>
 #include <sstream>
@@ -28,6 +29,7 @@ try {
     // RunServer owns cout's formatting state. Control replies use synchronized
     // stdio, and reading commands must not implicitly flush cout on this thread.
     std::cin.tie(nullptr);
+    std::atomic<bool> drained{false};
     std::thread controls([&] {
         const auto reply = [](const char* text) {
             std::fputs(text, stdout);
@@ -40,7 +42,28 @@ try {
             std::istringstream command(line);
             std::string target;
             int commit = 0, after = 0;
-            command >> target >> commit >> after;
+            command >> target;
+            if (target == "server-state") {
+                reply(drained.load() ? "drained\n" : "running\n");
+                continue;
+            }
+            if (target == "owner" || target == "shutdown") {
+                std::string id;
+                command >> id;
+                if (target == "owner") {
+                    const auto root = std::filesystem::path(argv[1]) / "databases" / id;
+                    const auto opened = glamdb::OpenExisting({root.string(), id});
+                    reply(opened ? "opened\n" : (opened.error().code + '\n').c_str());
+                } else {
+                    databases->Use(id, [&](const std::shared_ptr<glamdb::Engine>& engine) {
+                        const auto closed = engine->Shutdown(std::chrono::milliseconds(1));
+                        reply(closed ? "closed\n" : (closed.error().code + '\n').c_str());
+                        return glamdb::NTransport::TResponse{};
+                    });
+                }
+                continue;
+            }
+            command >> commit >> after;
             if (target == "exhaust-fds") {
                 getrlimit(RLIMIT_NOFILE, &original);
                 rlimit limit = original;
@@ -94,6 +117,7 @@ try {
         0,
         std::chrono::seconds(10),
         argc == 3 ? static_cast<size_t>(std::stoul(argv[2])) : 96);
+    drained = true;
     controls.join();
     databases->Shutdown();
     return 0;

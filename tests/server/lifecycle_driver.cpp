@@ -28,6 +28,15 @@ try {
     {
         glamdb::NServer::TRoutes routes(engine, {}, "test-token");
         glamdb::NServer::RunServer(routes, "127.0.0.1", 0, std::chrono::seconds(1));
+        const glamdb::NTransport::TRequest scan{"POST",
+            std::string("/collections/") + glamdb::test::collection_id + "/scan/open",
+            {{"authorization", "Bearer test-token"}, {"content-type", "application/json"}},
+            "{}"};
+        const auto response = routes.Handle(scan);
+        if (response.Status != 503 || glamdb::NTransport::ParseJson(response.Body)["error"]["code"] != "CANCELLED") {
+            std::cerr << "scan admission remained open after shutdown: " << response.Body << '\n';
+            return 7;
+        }
     }
     if (!engine->Shutdown(std::chrono::seconds(10))) {
         return 4;

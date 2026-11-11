@@ -1,7 +1,5 @@
-// An idempotent retry verifies only what its own outcome depends on: a
-// committed append checks its collection's root and that snapshot's files,
-// not other collections or every retained manifest list; a failed outcome
-// references no storage and reads none.
+// Healthy terminal receipt lookups use the verified store generation without
+// rereading warehouse files or modifying rows.
 
 #include "tests/support/checked.h"
 #include "tests/support/fault_fs.h"
@@ -9,7 +7,6 @@
 
 #include <chrono>
 #include <format>
-#include <set>
 
 namespace glamdb {
 namespace {
@@ -79,9 +76,6 @@ protected:
     }
 };
 
-// A retry in collection A returns A's receipt; collection B's files are irrelevant
-// to that outcome, yet VerifyRetained reopens B's root, manifest list, manifest and
-// Parquet footer (local_storage_backend.cpp:720-735 loops over every collection).
 TEST_F(BackendRetryScopeTest, RetryOfCommittedAppendDoesNotVerifyOtherCollections)
 {
     const auto first = Append(test::collection_id, B1Operation(0), FirstRows);
@@ -102,31 +96,73 @@ TEST_F(BackendRetryScopeTest, RetryOfCommittedAppendDoesNotVerifyOtherCollection
     EXPECT_EQ(foreignReads, 0U);
 }
 
-// Within one collection, VerifyReachable reads every retained manifest list
-// (base_state.cpp:317-344 -> 204-213), i.e. sum_{i<=n} i records, twice.
-TEST_F(BackendRetryScopeTest, RetryOfCommittedAppendDoesNotRereadEveryManifestList)
+TEST_F(BackendRetryScopeTest, OldReceiptLookupReadsNoWarehouseAsHistoryGrows)
 {
-    constexpr int Appends = 8;
-    for (int index = 0; index < Appends; ++index) {
-        ASSERT_EQ(Append(test::collection_id, B1Operation(index), FirstRows).disposition, CommitDisposition::Committed);
-    }
-
-    const auto mark = Faults_->Events().size();
-    ASSERT_EQ(Append(test::collection_id, B1Operation(0), FirstRows).disposition, CommitDisposition::Committed);
-
-    std::set<std::string> lists;
-    for (const auto& path : OpenedSince(mark)) {
-        if (std::filesystem::path(path).filename().string().starts_with("snap-")) {
-            lists.insert(path);
+    const auto first = Append(test::collection_id, B1Operation(0), FirstRows);
+    ASSERT_EQ(first.disposition, CommitDisposition::Committed);
+    for (int index = 1; index <= 16; ++index) {
+        ASSERT_EQ(Append(test::collection_id, B1Operation(index), SecondRows).disposition,
+            CommitDisposition::Committed);
+        if (index != 1 && index != 8 && index != 16) {
+            continue;
         }
+        SCOPED_TRACE(index);
+        const auto files = CountRegularFiles(Root_ / "warehouse");
+        const auto mark = Faults_->Events().size();
+        // Terminal retries ignore a new precondition and return the exact receipt.
+        EXPECT_EQ(Append(test::collection_id, B1Operation(0), FirstRows, {SnapshotPreconditionKind::NoSnapshot, 0}),
+            first);
+        const auto lookup = Engine_->FindAppendOutcome(test::collection_id, B1Operation(0));
+        ASSERT_TRUE(lookup);
+        ASSERT_TRUE(lookup->has_value());
+        EXPECT_EQ(test::Present(*lookup), first);
+        EXPECT_EQ(Faults_->Events().size(), mark);
+        EXPECT_EQ(CountRegularFiles(Root_ / "warehouse"), files);
     }
-    // Today: all `Appends` lists. The retried snapshot's list (plus, at most, the
-    // current one) is all a committed receipt depends on.
-    EXPECT_LE(lists.size(), 2U);
+    auto cursor = Engine_->Scan({.collection_id = test::collection_id});
+    ASSERT_TRUE(cursor);
+    int64_t rows = 0;
+    while (true) {
+        const auto batch = (*cursor)->Next();
+        ASSERT_TRUE(batch);
+        if (!*batch) {
+            break;
+        }
+        rows += (*batch)->num_rows();
+    }
+    EXPECT_EQ(rows, 35); // Three initial rows and sixteen two-row appends.
 }
 
-// A failed terminal outcome references no storage file, yet its retry runs the
-// same full verification (engine.cpp:910-921 does not distinguish outcomes).
+TEST_F(BackendRetryScopeTest, RecoveryVerifiesWarehouseBeforeReceiptLookupResumes)
+{
+    const auto first = Append(test::collection_id, B1Operation(0), FirstRows);
+    ASSERT_EQ(first.disposition, CommitDisposition::Committed);
+    ASSERT_EQ(Append(test::collection_id, B1Operation(1), SecondRows).disposition, CommitDisposition::Committed);
+    const auto files = FilesIn(Root_ / "warehouse" / test::collection_id / "data");
+    ASSERT_EQ(files.size(), 2U);
+    const auto saved = ReadBytes(files.front());
+    std::filesystem::remove(files.front());
+
+    const auto mark = Faults_->Events().size();
+    const auto broken = Engine_->Reconcile();
+    ASSERT_FALSE(broken);
+    EXPECT_EQ(broken.error().code, "CORRUPTION");
+    EXPECT_FALSE(OpenedSince(mark).empty());
+    EXPECT_FALSE(Engine_->GetHealth().write_ready);
+    EXPECT_EQ(Append(test::collection_id, B1Operation(0), FirstRows).disposition, CommitDisposition::CommitUnknown);
+    const auto blocked = Engine_->FindAppendOutcome(test::collection_id, B1Operation(0));
+    ASSERT_FALSE(blocked);
+    EXPECT_EQ(blocked.error().code, "RECOVERY_REQUIRED");
+
+    WriteBytes(files.front(), saved);
+    const auto recoveryMark = Faults_->Events().size();
+    ASSERT_TRUE(Engine_->Reconcile());
+    EXPECT_FALSE(OpenedSince(recoveryMark).empty());
+    const auto lookupMark = Faults_->Events().size();
+    EXPECT_EQ(Append(test::collection_id, B1Operation(0), FirstRows), first);
+    EXPECT_EQ(Faults_->Events().size(), lookupMark);
+}
+
 TEST_F(BackendRetryScopeTest, RetryOfFailedAppendReadsNoWarehouseFile)
 {
     ASSERT_EQ(Append(test::collection_id, B1Operation(0), FirstRows).disposition, CommitDisposition::Committed);

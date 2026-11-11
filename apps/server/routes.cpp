@@ -427,7 +427,7 @@ TResponse TRoutes::RoutePrepared(const TRequest& request,
 
 void TRoutes::CancelScans() const
 {
-    Scans_->Clear();
+    Scans_->Stop();
 }
 void TRoutes::CancelScans(const std::string& database) const
 {

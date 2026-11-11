@@ -13,6 +13,7 @@ public:
     TRoutes(std::shared_ptr<Engine> engine, std::filesystem::path uiRoot, std::string token);
     TRoutes(std::shared_ptr<TDatabases> databases, std::filesystem::path uiRoot, std::string token);
     NTransport::TResponse Handle(const NTransport::TRequest& request) const;
+    // Service shutdown: close scan admission and cancel without waiting for active reads.
     void CancelScans() const;
     void CancelScans(const std::string& database) const;
     bool IsAuthorized(const NTransport::TRequest& request) const;

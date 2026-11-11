@@ -74,6 +74,65 @@ TEST(ArrowInput, InputValidationErrorsSuggestFixingTheInput)
     }
 }
 
+// Canonical limits count NULL as one validity byte, independently of the
+// writer's fixed slots. Exact row and batch boundaries must agree in the
+// streaming fingerprint, reservation inspector and owned normalization.
+TEST(ArrowInput, NullHeavyCanonicalLimitsAgreeAcrossInputPaths)
+{
+    const SchemaSpec schema{
+        {{"a", FieldType::String, true}, {"b", FieldType::String, true}, {"n", FieldType::Int64, true}}};
+    for (const auto rows : {1, 16}) {
+        for (const auto extra : {0, 1}) {
+            SCOPED_TRACE(::testing::Message() << "rows=" << rows << " extra=" << extra);
+            // 2 * (validity + four-byte length) + NULL validity = 11.
+            // One row reaches 2 MiB; sixteen 1 MiB rows reach the batch cap
+            // while every row remains below its independent cap.
+            const size_t firstBytes = rows == 1 ? 1048570 : 524282;
+            const size_t secondBytes = rows == 1 ? 1048571 : 524283;
+            std::vector<Row> input(static_cast<size_t>(rows),
+                Row{std::string(firstBytes, 'x'), std::string(secondBytes, 'y'), std::monostate{}});
+            std::get<std::string>(input.back()[0]).append(static_cast<size_t>(extra), 'z');
+            arrow::StringBuilder first;
+            arrow::StringBuilder second;
+            for (const auto& row : input) {
+                ASSERT_TRUE(first.Append(std::get<std::string>(row[0])).ok());
+                ASSERT_TRUE(second.Append(std::get<std::string>(row[1])).ok());
+            }
+            const auto a = first.Finish();
+            const auto b = second.Finish();
+            ASSERT_TRUE(a.ok());
+            ASSERT_TRUE(b.ok());
+            // Omit n: every input path must account for its implicit NULL.
+            const auto batch = arrow::RecordBatch::Make(
+                arrow::schema({arrow::field("a", arrow::utf8()), arrow::field("b", arrow::utf8())}),
+                rows,
+                {*a, *b});
+            const auto normalized = NormalizeRows(schema, "00112233-4455-6677-8899-aabbccddeeff", input);
+            const auto fromArrow = NormalizeBatches(schema, "00112233-4455-6677-8899-aabbccddeeff", {batch});
+            const auto fingerprint = FingerprintBatches(schema, "00112233-4455-6677-8899-aabbccddeeff", {batch});
+            const auto reservation = InputReservation(schema, {batch});
+            if (extra == 0) {
+                ASSERT_TRUE(normalized);
+                ASSERT_TRUE(fromArrow);
+                ASSERT_TRUE(fingerprint);
+                ASSERT_TRUE(reservation);
+                EXPECT_EQ(normalized->decoded_bytes, rows == 1 ? 2097152U : 16777216U);
+                EXPECT_EQ(fromArrow->payload_hash, normalized->payload_hash);
+                EXPECT_EQ(*fingerprint, normalized->payload_hash);
+            } else {
+                ASSERT_FALSE(normalized);
+                ASSERT_FALSE(fromArrow);
+                ASSERT_FALSE(fingerprint);
+                ASSERT_FALSE(reservation);
+                EXPECT_EQ(normalized.error().code, "INPUT_TOO_LARGE");
+                EXPECT_EQ(fromArrow.error().code, "INPUT_TOO_LARGE");
+                EXPECT_EQ(fingerprint.error().code, "INPUT_TOO_LARGE");
+                EXPECT_EQ(reservation.error().code, "INPUT_TOO_LARGE");
+            }
+        }
+    }
+}
+
 TEST(ArrowInput, StreamingFingerprintMatchesIndependentAllTypesGolden)
 {
     const SchemaSpec schema{{{"s", FieldType::String, false},

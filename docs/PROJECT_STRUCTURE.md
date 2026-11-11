@@ -68,7 +68,7 @@ glamdb/
 | Path | Purpose |
 | --- | --- |
 | `AGENTS.md` | Repository guidance for coding agents, maintained alongside implementation changes. |
-| `public/storage/` | Installed public engine API/request/outcome/scan types, plus the independent storage schema DTO. |
+| `public/storage/` | Installed engine API/request/outcome/scan/metadata types, metric provenance and the independent storage schema DTO. |
 | `core/api/`, `core/catalog/`, `core/engine/` | `glamdb_core` / `glamdb::core`: canonical input, SQLite catalog, coordinator, and public facade. |
 | `core/backend/` | Storage backend bridging the coordinator seam to `glamdb_storage` (built with `GLAMDB_BUILD_STORAGE`). |
 | `core/scan/` | Predicate evaluation (always built), snapshot planning and Parquet scan cursor (storage builds). |
@@ -152,6 +152,11 @@ Iceberg catalog ordering. `tests/fault/` injects SQLite VFS/coordinator failures
 Those coordinator tests use a storage test double; the independent real-file
 pipeline lives in `tests/unit/storage/`. The installed third-party consumer
 lives in `probes/build_install/`.
+
+`tests/stress/` holds explicitly launched native load campaigns with disposable
+stores, Locust measurements and reopen verification. See its
+[manual runner](../tests/stress/README.md); it is excluded from default
+pytest/CTest discovery and CI.
 
 `probes/` holds bounded dependency/platform experiments, while `benchmarks/`
 holds workload and capacity measurements. Neither a dependency probe nor a

@@ -2,6 +2,7 @@
 
 #include "core/api/canonical.h"
 #include "core/catalog/durable_sqlite_catalog.h"
+#include "storage/metadata.h"
 
 #include <span>
 
@@ -52,6 +53,10 @@ public:
         bool write_failure_latched = false;
     };
     virtual ~StorageBackend() = default;
+    virtual EngineCapabilities GetCapabilities() const
+    {
+        return {.backend = BackendKind::Custom};
+    }
     // Concurrent, bounded observation only: no file I/O or writer/cache locks.
     virtual Health GetHealth() const
     {
@@ -61,8 +66,8 @@ public:
     PrepareCreate(const StoreInfo& store, const CreateCollectionRequest& request, std::string_view attempt_id) = 0;
     // Pre-binding admission against the exact committed base that the
     // coordinator is about to bind. A rejection consumes no operation ID.
-    virtual Status
-    CheckAppendAdmissible(const StoreInfo&, const CollectionInfo&, const BaseIdentity&, const NormalizedInput&)
+    // Allocate the normalized writer batch here and retain it in input.
+    virtual Status CheckAppendAdmissible(const StoreInfo&, const CollectionInfo&, const BaseIdentity&, NormalizedInput&)
     {
         return {};
     }
@@ -95,18 +100,6 @@ public:
     virtual Status VerifyRetained(const StoreInfo& store,
         std::span<const CollectionView> collections,
         std::span<const OperationRecord> operations) = 0;
-    // An idempotent retry of a committed append: verify that this receipt is
-    // still backed by retained storage (its collection's committed root, the
-    // receipt's snapshot and that snapshot's files) without re-verifying
-    // unrelated history. `operations` are the collection's operation records.
-    // The default verifies the collection's whole retained state.
-    virtual Status VerifyCommittedAppend(const StoreInfo& store,
-        const CollectionView& collection,
-        std::span<const OperationRecord> operations,
-        const AppendResult&)
-    {
-        return VerifyRetained(store, std::span(&collection, 1), operations);
-    }
     // Independent read-only view for scans; it never joins a writer attempt.
     virtual Result<std::shared_ptr<iceberg::FileIO>> ReadOnlyFileIO()
     {

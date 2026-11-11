@@ -13,6 +13,10 @@
 #include <string>
 #include <string_view>
 
+namespace arrow {
+class MemoryPool;
+}
+
 namespace NGlamDB::NIO {
 struct ILocalFS;
 class TStoreDirs;
@@ -33,6 +37,8 @@ struct TLocalStorageOptions
     NGlamDB::NStorage::TStorageLimits Storage{};
     NGlamDB::NStorage::TDataWriterLimits Writer{};
     NGlamDB::NStorage::TFileIOLimits FileIO{};
+    // Allocator for the normalized writer batch; empty selects Arrow's default.
+    std::shared_ptr<arrow::MemoryPool> InputPool{};
     // Filesystem adapter; empty selects the POSIX implementation. Tests inject
     // faults here.
     std::shared_ptr<NGlamDB::NIO::ILocalFS> Fs{};
@@ -52,13 +58,17 @@ public:
     Open(const std::filesystem::path& root, const StoreInfo& store, TLocalStorageOptions options = {});
 
     Health GetHealth() const override;
+    EngineCapabilities GetCapabilities() const override
+    {
+        return {.backend = BackendKind::LocalStorage, .append = true, .scan = true, .metadata = true};
+    }
 
     Result<std::unique_ptr<StagedCreate>>
     PrepareCreate(const StoreInfo& store, const CreateCollectionRequest& request, std::string_view attempt_id) override;
     Status CheckAppendAdmissible(const StoreInfo& store,
         const CollectionInfo& collection,
         const BaseIdentity& base,
-        const NormalizedInput& input) override;
+        NormalizedInput& input) override;
     Result<std::unique_ptr<StagedAppend>> PrepareAppend(const StoreInfo& store,
         const BoundOperation& binding,
         const CollectionInfo& collection,
@@ -72,10 +82,6 @@ public:
     Status VerifyRetained(const StoreInfo& store,
         std::span<const CollectionView> collections,
         std::span<const OperationRecord> operations) override;
-    Status VerifyCommittedAppend(const StoreInfo& store,
-        const CollectionView& collection,
-        std::span<const OperationRecord> operations,
-        const AppendResult& receipt) override;
     Result<std::shared_ptr<iceberg::FileIO>> ReadOnlyFileIO() override;
 
     // A verified candidate is tentative until PublicationFinished confirms the

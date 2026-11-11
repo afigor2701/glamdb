@@ -152,7 +152,7 @@ class NativeHTTP(unittest.TestCase):
         self.assertEqual(self.api(path + '/operations/' + body['operation_id']), outcome)
         self.assertEqual(self.api(path + '/scan', {})['rows'][0]['key'], 'survives_process_crash')
 
-    def test_failed_reconcile_preserves_operation_recovery_context(self):
+    def test_observed_corruption_blocks_receipts_until_reconcile(self):
         path = self.collection()
         body = {'operation_id': str(uuid.uuid4()), 'rows': [{'key': 'recoverable'}]}
         committed = self.api(path + '/append', body)
@@ -161,6 +161,8 @@ class NativeHTTP(unittest.TestCase):
         for index, file in enumerate(metadata):
             file.rename(Path(self.tmp.name) / f'metadata-{index}')
         try:
+            self.assertEqual(self.api(path + '/append', body), committed)
+            self.assertEqual(self.api(path + '/scan', {}, status=500)['error']['code'], 'CORRUPTION')
             unknown = self.api(path + '/append', body, status=503)
             self.assertEqual(unknown['outcome'], 'commit_unknown')
             health = self.api('/databases/' + self.store_id + '/readyz', status=503)
@@ -168,14 +170,14 @@ class NativeHTTP(unittest.TestCase):
             self.assertFalse(health['read_available'])
             self.assertFalse(health['write_ready'])
             lookup = path + '/operations/' + body['operation_id']
-            self.assertEqual(self.api(lookup, status=503)['outcome'], 'commit_unknown')
+            self.assertEqual(self.api(lookup, status=503)['error']['code'], 'RECOVERY_REQUIRED')
             status, _, _ = self.request('/databases/' + self.store_id + '/reconcile', {})
             self.assertGreaterEqual(status, 400)
-            self.assertEqual(self.api(lookup, status=503)['outcome'], 'commit_unknown')
+            self.assertEqual(self.api(lookup, status=503)['error']['code'], 'RECOVERY_REQUIRED')
             self.api('/databases/' + self.store_id + '/open', {}, status=503)
-            self.assertEqual(self.api(lookup, status=503)['outcome'], 'commit_unknown')
+            self.assertEqual(self.api(lookup, status=503)['error']['code'], 'RECOVERY_REQUIRED')
             self.api('/databases', {'name': 'test_database'}, status=503)
-            self.assertEqual(self.api(lookup, status=503)['outcome'], 'commit_unknown')
+            self.assertEqual(self.api(lookup, status=503)['error']['code'], 'RECOVERY_REQUIRED')
         finally:
             for index, file in enumerate(metadata):
                 (Path(self.tmp.name) / f'metadata-{index}').rename(file)

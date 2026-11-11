@@ -46,6 +46,9 @@ stores identities, persisted engine limits and open intent; collection/data writ
 Scans use bounded fixed-view pages with per-database quotas, finite replay retention,
 expiry and explicit cancellation. Separate HTTP data, lifecycle and control workers
 keep healthy databases and descriptors available during long operations.
+Outcome lookup refuses catalog contention without blocking control workers.
+Scan pages reserve replay capacity before consumption; admission refusal preserves
+the existing cursor and its last replay. Other page failures invalidate it.
 The network CLI also builds independently with OpenSSL; optional offline commands
 are in `apps/admin` and never required for server initialization.
 Collection routes are scoped by `/databases/{id}`; optional legacy
@@ -54,7 +57,7 @@ separate, explicitly disposable in-memory mock remains a development profile. Th
 invariants below describe the intended engine, not qualified guarantees.
 
 Data studio separates compact read and schema-driven write panels; the form
-generates typed JSON, while a batch JSON editor remains optional. Without native
+generates typed JSON, while a batch JSON editor remains optional. Without HTTP
 metadata APIs, Overview can count rows via a cancellable fixed-snapshot scan.
 Snapshots and Storage show only confirmed receipts from this session, clearly
 labelled as partial observations rather than complete history or file inventory.
@@ -72,8 +75,11 @@ Append preserves every input row, including duplicate keys. It provides neither
 key uniqueness nor replacement semantics.
 
 Key-value upserts and deletes are a subsequent extension using copy-on-write
-and an explicit KV collection mode. Additional native metadata/explain APIs and
-object storage remain later extensions. Compaction, snapshot expiration,
+and an explicit KV collection mode. Native capabilities, receipt-backed snapshot
+history, selected-view statistics, snapshot-bound file/row-group details,
+explain and cursor profiles use the public
+facade; see [the metadata guide](docs/development/METADATA.md). Their HTTP/SDK/UI
+adapters and object storage remain later extensions. Compaction, snapshot expiration,
 garbage collection, asynchronous admission, replication, multiple writers, and
 schema evolution are outside the initial append scope. Consult
 [docs/ROADMAP.md](docs/ROADMAP.md) when assessing feature scope; its current
@@ -130,7 +136,11 @@ Preserve these boundaries when adding or changing engine behavior:
   ID to its canonical content hash before file I/O. Persist the committed
   outcome atomically with the catalog pointer. The same ID and hash return the
   original terminal outcome, including failure; a different hash conflicts.
-  Outcomes survive restart and do not expire. The initial engine has no input
+  Outcomes survive restart and do not expire. Healthy terminal receipt lookups
+  use the verified generation and query one catalog record without rereading
+  warehouse files or enumerating history. Lookup is not a scrub: observed
+  corruption or uncertain publication requires full reconciliation and its
+  durability fence before lookups resume. The initial engine has no input
   payload journal or asynchronous job queue.
 - **Snapshot reads.** Resolve the selected view once and enumerate its files
   through Iceberg manifests. Read neither uncommitted nor orphan files by
@@ -171,6 +181,7 @@ Preserve these boundaries when adding or changing engine behavior:
 | `apps/server/`, `apps/transport/` | `glamdb`: Asio HTTP server, shared precise codecs and native outcome serialization. |
 | `cmake/` | Build options, sanitizers, quality targets, and dependency recipes. |
 | `tests/` | Native unit/recovery/SqlCatalog/VFS/consumer suites, `vertical/` public-API storage tests, `mock/` in-memory scan tests, verification and actual SDK HTTP/HTTPS tests. |
+| `tests/stress/` | Explicit manual native capacity campaigns; excluded from default pytest/CTest and CI. |
 | `apps/mock_server/` | Disposable Python mock, real HTTP/Arrow, no warehouse/catalog access. |
 | `fixtures/`, `tools/verification/` | Literal canonical/metadata inputs, independent row oracle and evidence helpers. |
 | `sdk/python/`, `ui/` | Standalone Python HTTP SDK; HTML/CSS/ES-module pink workbench and browser/unit tests. |
@@ -230,7 +241,7 @@ the unit, I/O, storage, mock, vertical, and fault suites. Tooling tests use unit
 The normal profile also runs named `vertical`, `nostorage` (a separate
 `GLAMDB_BUILD_STORAGE=OFF` build) and `mock` contours.
 Python tests use repository-wide pytest discovery (excluding native tooling,
-vendor, and generated trees); Node and Playwright use their own discovery.
+manual stress suites, vendor, and generated trees); Node and Playwright use their own discovery.
 All four PR native profiles are required checks and run on every PR, including
 documentation-only changes. The main ruleset is tracked in
 `.github/rulesets/main.json`; changes also need to be applied in GitHub.
@@ -281,7 +292,10 @@ run `./scripts/test-storage-in-docker.sh asan-ubsan`. See
 `GLAMDB_DATA`; it rebuilds the dependency prefix when its recipe fingerprint changes.
 
 The coordinator supplies owned, immutable normalized batches and expected
-operation summaries, runs capacity preflight before binding an attempt, and
+operation summaries. Backend admission checks capacity and allocates the writer
+batch before binding; production reuses it under the call's owned-input reservation.
+The reservation includes Arrow slot growth for NULL and omitted fields.
+Allocation refusal consumes no operation ID. The coordinator
 confirms the outer catalog COMMIT. A publication guard's `GetCandidate()` is
 tentative until that confirmation. Scan callers retain a `ReadOnlyView()` so
 reads do not join the writer's attempt. Isolated storage tests use an in-memory
@@ -416,6 +430,11 @@ the network CLI and codecs. `GLAMDB_BUILD_ADMIN=ON` additionally builds the offl
 `glamdb-admin`; it is not required to initialize or operate a server. Run native browser checks with `GLAMDB_NATIVE_SERVER`
 pointing to the built server; `GLAMDB_E2E_PYTHON` can select
 the workbench Python environment. See the native HTTP guide for exact commands.
+
+SIGINT/SIGTERM close socket and scan admission and mark active scans cancelled
+before worker draining. Cancellation never waits on a scan's session lock; retain
+its read lease until the call finishes. Accepted writes still drain, and shutdown
+deadlines or lost COMMIT replies never establish a definite failed outcome.
 
 Native CI requires SDK/Arrow/schema checks in every profile and native browser
 acceptance plus a standalone client build in the normal profile. MSan uses the

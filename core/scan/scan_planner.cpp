@@ -110,10 +110,9 @@ void CheckRoot(const iceberg::TableMetadata& metadata, const BaseIdentity& base)
         "only the initial unpartitioned Iceberg v2 schema is supported");
 }
 
-void AppendFiles(const TScanManifests& plan,
+std::vector<std::shared_ptr<iceberg::DataFile>> ReadDataFiles(const TScanManifests& plan,
     const std::shared_ptr<iceberg::FileIO>& io,
-    const iceberg::ManifestFile& manifest,
-    std::vector<TScanFile>& files)
+    const iceberg::ManifestFile& manifest)
 {
     if (manifest.content != iceberg::ManifestContent::kData) {
         Unsupported("delete manifests are not supported");
@@ -132,6 +131,7 @@ void AppendFiles(const TScanManifests& plan,
     const auto entries = DecodePersisted("read manifest", [&] {
         return Take(reader->LiveEntries(), "IO_ERROR", "read manifest");
     });
+    std::vector<std::shared_ptr<iceberg::DataFile>> files;
     for (const auto& entry : entries) {
         const auto& file = entry.data_file;
         Require(file != nullptr, "CORRUPTION", "manifest entry has no data file");
@@ -143,24 +143,44 @@ void AppendFiles(const TScanManifests& plan,
         Require(file->file_size_in_bytes > 0 && file->record_count > 0,
             "CORRUPTION",
             "manifest has invalid data file metrics");
-        files.push_back({file->file_path, file->file_size_in_bytes, file->record_count});
+        files.push_back(file);
     }
+    return files;
 }
 
 } // namespace
 
-Result<TScanManifests>
-PlanManifests(const std::shared_ptr<iceberg::FileIO>& io, const BaseIdentity& base, const SnapshotSelector& selector)
+Result<std::unique_ptr<iceberg::TableMetadata>> ReadScanRoot(const std::shared_ptr<iceberg::FileIO>& io,
+    const BaseIdentity& base)
 {
     try {
         Require(io != nullptr, "DEPENDENCY_UNAVAILABLE", "storage reader is not installed");
         NGlamDB::NStorage::RegisterStorageFormats();
         const auto limit = static_cast<int64_t>(NGlamDB::NStorage::TStorageLimits{}.RootBytes);
-        const auto metadata =
-            Take(NGlamDB::NStorage::ReadTableMetadata(*io, base.metadata_location, std::nullopt, limit),
-                "IO_ERROR",
-                "read committed root");
+        auto metadata = Take(NGlamDB::NStorage::ReadTableMetadata(*io, base.metadata_location, std::nullopt, limit),
+            "IO_ERROR",
+            "read committed root");
         CheckRoot(*metadata, base);
+        return metadata;
+    } catch (const Failure& error) {
+        return std::unexpected(error.detail);
+    } catch (const std::bad_alloc& error) {
+        return std::unexpected(
+            ErrorDetail{"RESOURCE_EXHAUSTED", BoundedDiagnostic(error.what()), RetryHint::OperatorAction});
+    } catch (const std::exception& error) {
+        return std::unexpected(ErrorDetail{"INTERNAL", BoundedDiagnostic(error.what()), RetryHint::OperatorAction});
+    }
+}
+
+Result<TScanManifests>
+PlanManifests(const std::shared_ptr<iceberg::FileIO>& io, const BaseIdentity& base, const SnapshotSelector& selector)
+{
+    try {
+        const auto root = ReadScanRoot(io, base);
+        if (!root) {
+            return std::unexpected(root.error());
+        }
+        const auto& metadata = *root;
         TScanManifests plan;
         const auto snapshot = SelectSnapshot(*metadata, selector);
         if (!snapshot) {
@@ -192,12 +212,30 @@ PlanManifests(const std::shared_ptr<iceberg::FileIO>& io, const BaseIdentity& ba
 Result<std::vector<TScanFile>>
 ManifestFiles(const std::shared_ptr<iceberg::FileIO>& io, const TScanManifests& plan, size_t index)
 {
+    auto data = ReadManifestDataFiles(io, plan, index);
+    if (!data) {
+        return std::unexpected(data.error());
+    }
+    try {
+        std::vector<TScanFile> files;
+        files.reserve(data->size());
+        for (const auto& file : *data) {
+            files.push_back({file->file_path, file->file_size_in_bytes, file->record_count});
+        }
+        return files;
+    } catch (const std::bad_alloc& error) {
+        return std::unexpected(
+            ErrorDetail{"RESOURCE_EXHAUSTED", BoundedDiagnostic(error.what()), RetryHint::OperatorAction});
+    }
+}
+
+Result<std::vector<std::shared_ptr<iceberg::DataFile>>>
+ReadManifestDataFiles(const std::shared_ptr<iceberg::FileIO>& io, const TScanManifests& plan, size_t index)
+{
     try {
         Require(io != nullptr, "DEPENDENCY_UNAVAILABLE", "storage reader is not installed");
         Require(index < plan.Manifests.size(), "INTERNAL", "manifest index is out of range");
-        std::vector<TScanFile> files;
-        AppendFiles(plan, io, plan.Manifests[index], files);
-        return files;
+        return ReadDataFiles(plan, io, plan.Manifests[index]);
     } catch (const Failure& error) {
         return std::unexpected(error.detail);
     } catch (const std::bad_alloc& error) {

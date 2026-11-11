@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -149,6 +150,59 @@ void CheckViews(glamdb::Engine& engine, int64_t snapshotA, int64_t snapshotB)
                              .batch_rows = 1}),
         "compound filtered scan");
     CheckRows(*filtered, {{"dup", 1}, {"dup", 1}}, glamdb::SnapshotSelector::Id(snapshotB));
+    const auto capabilities = engine.GetCapabilities();
+    Check(capabilities.backend == glamdb::BackendKind::LocalStorage && capabilities.metadata && capabilities.scan &&
+            capabilities.append && !capabilities.file_pruning && !capabilities.row_group_pruning &&
+            !capabilities.durability_qualified,
+        "native capabilities do not claim pruning or qualified durability");
+    const auto history = Take(engine.ListSnapshots(CollectionId), "snapshot history");
+    Check(history.snapshots.size() == 2 && history.snapshots[0].snapshot_id == snapshotA &&
+            history.snapshots[1].snapshot_id == snapshotB && history.snapshots[1].parent_snapshot_id == snapshotA,
+        "retained history and parent identity");
+    const auto a = Take(engine.FindAppendOutcome(CollectionId, OperationA), "metadata receipt A");
+    const auto b = Take(engine.FindAppendOutcome(CollectionId, OperationB), "metadata receipt B");
+    Check(a && b && a->result && b->result && history.snapshots[0].receipt == *a->result &&
+            history.snapshots[1].receipt == *b->result,
+        "history includes original durable receipts");
+    for (const auto& [selector, rows, files] : {std::tuple{glamdb::SnapshotSelector::Latest(), 5, 2},
+             std::tuple{glamdb::SnapshotSelector::Id(snapshotA), 3, 1},
+             std::tuple{glamdb::SnapshotSelector::InitialEmpty(), 0, 0}})
+    {
+        const auto stats = Take(engine.GetStatistics(CollectionId, selector), "selected statistics");
+        Check(stats.rows.value == rows && stats.data_files.value == files && !stats.logical_bytes.value &&
+                stats.rows.kind == glamdb::MetricKind::Metadata && stats.identity == history.identity,
+            "view-specific metadata with unavailable logical size");
+        const auto listing = Take(engine.ListFiles(CollectionId, selector), "selected files");
+        Check(listing.Identity == stats.identity && listing.SelectorResolved == stats.selector_resolved &&
+                static_cast<int64_t>(listing.Files.size()) == files,
+            "manifest file membership uses the selected view");
+        int64_t fileRows = 0;
+        for (const auto& file : listing.Files) {
+            const auto details = Take(engine.GetFileDetails(CollectionId, file.FileID, selector), "file details");
+            Check(details.File == file && details.SelectorResolved == listing.SelectorResolved &&
+                    !details.RowGroups.empty() && file.FileID.size() == 64,
+                "opaque file IDs resolve only through manifest membership");
+            int64_t groupRows = 0;
+            for (const auto& group : details.RowGroups) {
+                groupRows += group.RecordCount;
+                Check(!group.Columns.empty() && group.Columns.front().FieldID == 1,
+                    "Parquet row groups retain stable field IDs");
+            }
+            Check(groupRows == file.RecordCount, "row-group counts match the manifest");
+            fileRows += file.RecordCount;
+        }
+        Check(fileRows == rows, "listed files match selected rows");
+        const auto explanation =
+            Take(engine.ExplainScan({.collection_id = CollectionId, .selector = selector}), "explain");
+        Check(explanation.info.selector_resolved == stats.selector_resolved &&
+                explanation.candidates.rows.value == rows && !explanation.file_pruning &&
+                !explanation.row_group_pruning && explanation.estimated_output_rows.value == rows,
+            "explain uses the selected fixed view");
+    }
+    auto zero = Take(engine.Scan({.collection_id = CollectionId, .limit = 0}), "zero limit");
+    Check(!Take(zero->Next(), "zero next") && zero->Profile().data_files_read.value == 0 &&
+            zero->Profile().rows_returned.value == 0 && zero->Profile().state == glamdb::ScanState::Complete,
+        "zero-limit execution reads no data files");
 }
 
 void Write(glamdb::Engine& engine, const std::string& receiptPath)
@@ -211,6 +265,21 @@ void Reopen(glamdb::Engine& engine, const std::string& receiptPath)
 
 void CheckUnavailable(glamdb::Engine& engine)
 {
+    const auto capabilities = engine.GetCapabilities();
+    Check(capabilities.backend == glamdb::BackendKind::Unavailable && !capabilities.metadata && !capabilities.scan &&
+            !capabilities.append && !capabilities.durability_qualified,
+        "storage-disabled capabilities");
+    const auto stats = engine.GetStatistics(CollectionId);
+    const auto history = engine.ListSnapshots(CollectionId);
+    const auto explain = engine.ExplainScan({.collection_id = CollectionId});
+    const auto files = engine.ListFiles(CollectionId);
+    const auto details = engine.GetFileDetails(CollectionId, std::string(64, '0'));
+    Check(!stats && stats.error().code == "DEPENDENCY_UNAVAILABLE" && !history &&
+            history.error().code == "DEPENDENCY_UNAVAILABLE" && !explain &&
+            explain.error().code == "DEPENDENCY_UNAVAILABLE" && !files &&
+            files.error().code == "DEPENDENCY_UNAVAILABLE" && !details &&
+            details.error().code == "DEPENDENCY_UNAVAILABLE",
+        "storage-disabled metadata reports dependency errors");
     const auto created = engine.CreateCollection({CollectionId, "events", Schema});
     Check(created.disposition == glamdb::CommitDisposition::DefinitelyNotCommitted && !created.info && created.error &&
             created.error->code == "DEPENDENCY_UNAVAILABLE",

@@ -124,6 +124,56 @@ class ScanHTTP(NativeHTTP):
         self.assertEqual(status, 200)
         self.assertEqual(pa.ipc.open_stream(data).read_all().to_pylist(), [row])
 
+    def test_replay_pressure_preserves_explicit_cursor(self):
+        fields = [{'name': 'key', 'type': 'string', 'nullable': False}] + [
+            {'name': 's' + str(i), 'type': 'string', 'nullable': True} for i in range(9)]
+        row = dict({'key': 'first'}, **{'s' + str(i): '\x01' * 175000 for i in range(9)})
+        second = dict(row, key='second')
+
+        def seed(database):
+            base = '/databases/' + database + '/collections'
+            collection = str(uuid.uuid4())
+            self.api(base, {'collection_id': collection, 'name': 'large', 'schema': {'fields': fields}})
+            path = base + '/' + collection
+            for value in (row, second):
+                self.api(path + '/append', {'operation_id': str(uuid.uuid4()), 'rows': [value]})
+            return path
+
+        victim = seed(self.store_id)
+        opened = self.api(victim + '/scan/open', {})
+        holders = [seed(self.api('/databases', {'name': 'holder' + str(i)})['database_id']) for i in range(2)]
+        tokens = []
+        for index in range(16):
+            path = holders[index // 8]
+            status, _, data = self.request(path + '/scan', {})
+            page = json.loads(data)
+            if status == 429:
+                self.assertEqual(page['error']['code'], 'RESOURCE_EXHAUSTED')
+                break
+            self.assertEqual(status, 200, data)
+            self.assertGreater(len(data), 9000000)
+            tokens.append((path, page['next_cursor']))
+        else:
+            self.fail('replay capacity was not enforced')
+
+        request = {'cursor': opened['cursor']}
+        for _ in range(2):
+            failure = self.api(victim + '/scan', request, status=429)
+            self.assertEqual(failure['error']['code'], 'RESOURCE_EXHAUSTED')
+        path, token = tokens.pop()
+        self.api(path + '/scan/cancel', {'cursor': token})
+        self.api(victim + '/append', {'operation_id': str(uuid.uuid4()), 'rows': [{'key': 'later'}]})
+        first = self.api(victim + '/scan', request)
+        self.assertIn(first['rows'], ([row], [second]))
+        self.assertEqual(first['snapshot_id'], opened['snapshot_id'])
+        self.assertEqual(self.api(victim + '/scan', request), first)
+        for path, token in tokens:
+            self.api(path + '/scan/cancel', {'cursor': token})
+        last = self.api(victim + '/scan', {'cursor': first['next_cursor']})
+        self.assertEqual(sorted(first['rows'] + last['rows'], key=lambda value: value['key']), [row, second])
+        self.assertEqual(last['snapshot_id'], opened['snapshot_id'])
+        self.assertIsNone(last['next_cursor'])
+
     def test_open_capacity_cancel_reconcile_and_restart(self):
         path = self.collection()
         tokens = [self.api(path + '/scan/open', {})['cursor'] for _ in range(8)]
@@ -265,12 +315,14 @@ class ScanHTTP(NativeHTTP):
             {'name': 'n' + str(i), 'type': 'int64', 'nullable': False} for i in range(63)]
         self.api('/collections', {'collection_id': cid, 'name': 'ipc_wide', 'schema': {'fields': fields}})
         path = '/collections/' + cid
+        # Cross the 128-batch coalescing boundary without exhausting the
+        # cursor idle timeout under sanitizer overhead.
         for _ in range(4):
             rows = [dict({'key': 'same'}, **{'n' + str(i): str(int(index % 4 == 0)) for i in range(63)})
-                    for index in range(6000)]
+                    for index in range(256)]
             self.api(path + '/append', {'operation_id': str(uuid.uuid4()), 'rows': rows})
-        for body, expected in [({'batch_rows': 1, 'limit': 6000}, 6000),
-            ({'batch_rows': 4, 'predicate': {'op': 'eq', 'field': 'n0', 'value': '1'}}, 6000)]:
+        for body, expected in [({'batch_rows': 1, 'limit': 512}, 512),
+            ({'batch_rows': 4, 'predicate': {'op': 'eq', 'field': 'n0', 'value': '1'}}, 256)]:
             count = 0
             while True:
                 status, headers, data = self.request(path + '/scan', body, accept='application/vnd.apache.arrow.stream')

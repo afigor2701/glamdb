@@ -294,7 +294,13 @@ collection and representation; stale or missing tokens return 404, never restart
 queries. Each database has eight sessions within a server limit of 64. Idle sessions expire
 after 60 seconds (checked every second); replay does not refresh that deadline. All
 sessions expire after five minutes. Retained response bodies have a shared 128 MiB
-budget; completed replay caches may be evicted to admit new scans. A failed page invalidates its session. Close, reconciliation
+budget; completed replay caches may be evicted to admit new scans. Before advancing
+a page, the server reserves a full 16 MiB response in addition to its previous
+replay body. Replay-capacity refusal returns 429 before consuming rows and preserves
+the cursor and its previous replay; cancel unused scans and retry the same token.
+Successful encoding replaces that reservation with the actual retained body size.
+Other page failures invalidate the session. These are replay reservations, not a
+bound on decode buffers or outgoing copies. Close, reconciliation
 and shutdown release sessions after admitted calls drain. Cancellation releases
 between page calls; it does not interrupt an active filesystem read.
 
@@ -334,7 +340,10 @@ Collections accept `page_size` 1..1000; insufficient size or any cursor returns
 Standalone Asio provides asynchronous sockets, timers and signals. Four data workers
 admit at most two concurrent calls per database. Two lifecycle workers and two
 control/static workers keep database descriptors and outcome lookup independent of
-long data calls; health and global capabilities run on the I/O thread. Core retains
+long data calls. Outcome lookup uses nonblocking catalog admission: publication
+contention returns 503 `OPERATION_IN_PROGRESS`, never authoritative absence or an
+append disposition. Retry the original lookup after publication finishes. Health
+and global capabilities run on the I/O thread. Core retains
 its single serialized writer. Overload returns 503 with `Retry-After: 1` within the
 bounded response capacity. There are at most 64 header readers (32 per peer), 16
 admitted request bodies and 96 total connections, including overload responses;
@@ -368,11 +377,13 @@ reverse proxy for remote access. There is one bearer identity, no user/RBAC laye
 The token comes only from `GLAMDB_TOKEN`, never a URL, log, config response or UI
 storage. API responses are uncached. CORS is disabled; the UI uses the same origin.
 
-SIGINT/SIGTERM stop accepting and close incomplete requests; admitted calls finish
-and responses drain before Engine::Shutdown releases store ownership. OS IO may
-still block; there is no forced rollback or detached writer. Client disconnects
-do not cancel publication. Scan pages are synchronous bounded responses; cursor
-cancellation releases the remaining read session.
+SIGINT/SIGTERM stop accepting, close incomplete requests, cancel scan sessions and
+reject new scans before draining workers. Cancellation reaches core cursors without
+waiting on their session locks; read leases remain owned until those calls finish.
+Admitted writes and responses drain before Engine::Shutdown releases store
+ownership. OS IO may still block; there is no forced rollback or detached writer.
+Client disconnects do not cancel publication. Scan pages are synchronous bounded
+responses; cancelled cursors cannot publish another page.
 
 Static serving allows only index, theme and supported assets beneath `--ui-root`,
 rejects traversal and symlinks, and never exposes the store. Administrators must
@@ -431,11 +442,15 @@ its Python environment through `GLAMDB_NATIVE_PYTHON` if needed.
 `glamdb.native_http_fault` uses the production managed HTTP service and real
 storage with a test-only SQLite VFS control channel. It covers faults before/after
 create, append and registry COMMIT, failed recovery fencing, failure recording,
-producer path corruption, descriptor exhaustion, and close waiting for an admitted
-native append. `glamdb.http_review` checks HTTP error responses, Expect handshakes,
+producer path corruption, descriptor exhaustion, close waiting for an admitted
+native append, and SIGTERM draining publication after a shutdown deadline while
+an independent embedded open still fails. Fresh-process restart resolves uncertain
+COMMIT results and retains original receipts and duplicate rows.
+`glamdb.http_review` checks HTTP error responses, Expect handshakes,
 idle-header admission, media negotiation and canonical scoped dispatch.
 `glamdb.scan_http` covers fixed-view pages beyond 100000 rows and 16 MiB, response
 replay, scope, cancellation, expiry, resource capacity, small-batch IPC, abandoned
 SDK iterators and real read corruption. Scan session tests also pause a real Parquet
-read while another database progresses and enforce the shared replay byte budget.
+read while another database progresses, check nonblocking shutdown cancellation
+and closed scan admission, and enforce the shared replay byte budget.
 These deterministic checks are separate from physical power-loss qualification.

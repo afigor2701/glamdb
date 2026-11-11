@@ -149,7 +149,7 @@ public:
     Status CheckAppendAdmissible(const StoreInfo& store,
         const CollectionInfo& collection,
         const BaseIdentity& base,
-        const detail::NormalizedInput& input) override
+        detail::NormalizedInput& input) override
     {
         return Inner_->CheckAppendAdmissible(store, collection, base, input);
     }
@@ -185,13 +185,6 @@ public:
         return Inner_->VerifyRetained(store, collections, operations);
     }
 
-    Status VerifyCommittedAppend(const StoreInfo& store,
-        const detail::CollectionView& collection,
-        std::span<const detail::OperationRecord> operations,
-        const AppendResult& receipt) override
-    {
-        return Inner_->VerifyCommittedAppend(store, collection, operations, receipt);
-    }
     Result<std::shared_ptr<iceberg::FileIO>> ReadOnlyFileIO() override
     {
         return Inner_->ReadOnlyFileIO();
