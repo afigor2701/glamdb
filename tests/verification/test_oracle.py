@@ -19,6 +19,10 @@ def test_comparison_and_filter_only_column(verify, op, value, expected):
 
 
 @pytest.mark.parametrize("predicate,expected", [
+    ({"op": "true"}, ["null", "one", "two", "two"]),
+    ({"op": "not", "arg": {"op": "true"}}, []),
+    ({"op": "and", "args": [{"op": "true"}, {"op": "eq", "field": "n", "value": "1"}]}, ["one"]),
+    ({"op": "or", "args": [{"op": "not", "arg": {"op": "true"}}, {"op": "is_null", "field": "n"}]}, ["null"]),
     ({"op": "in", "field": "n", "values": []}, []),
     ({"op": "in", "field": "n", "values": ["1", None]}, ["one"]),
     ({"op": "not", "arg": {"op": "in", "field": "n", "values": ["1", None]}}, []),
@@ -46,6 +50,7 @@ def test_projection_limit_initial_empty_and_owned_result(verify):
 
 
 @pytest.mark.parametrize("predicate", [
+    {"op": "true", "field": "n"},
     {"op": "eq", "field": "missing", "value": 1},
     {"op": "eq", "field": "n", "value": True},
     {"op": "eq", "field": "n", "value": "1.0"},
@@ -79,6 +84,12 @@ def test_exhaustive_sql_3vl_truth_tables(verify, op, true_ids, false_ids):
     predicate = {"op": op, "args": [{"op": "eq", "field": name, "value": True} for name in ["a", "b"]]}
     assert verify.scan_rows(schema, rows, ["id"], predicate) == [{"id": i} for i in true_ids]
     assert verify.scan_rows(schema, rows, ["id"], {"op": "not", "arg": predicate}) == [{"id": i} for i in false_ids]
+    dual_op = "or" if op == "and" else "and"
+    de_morgan = {
+        "op": dual_op,
+        "args": [{"op": "not", "arg": {"op": "eq", "field": name, "value": True}} for name in ["a", "b"]],
+    }
+    assert verify.scan_rows(schema, rows, ["id"], {"op": "not", "arg": predicate}) == verify.scan_rows(schema, rows, ["id"], de_morgan)
 
 
 def test_exact_timestamp_float_and_binary_string_comparisons(verify):

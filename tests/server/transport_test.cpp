@@ -29,7 +29,7 @@ TEST(Transport, HealthStateFixturesKeepReadinessSeparateFromDurability)
 TEST(Transport, RejectsAmbiguousJsonAndFraming)
 {
     EXPECT_THROW(ParseJson(R"({"operation_id":"a","operation_id":"b"})"), TFailure);
-    EXPECT_THROW(ParseJson(std::string(34, '[') + "0" + std::string(34, ']')), TFailure);
+    EXPECT_THROW(ParseJson(std::string(162, '[') + "0" + std::string(162, ']')), TFailure);
     for (const auto* header : {"Content-Length: 1\r\nContent-Length: 1\r\n",
              "Transfer-Encoding: chunked\r\n",
              " Content-Length: 1\r\n",
@@ -138,10 +138,10 @@ TEST(Transport, RejectsLateDecodedDuplicateKeyInLargeArray)
 }
 TEST(Transport, PreservesJsonDepthAndEventBoundaries)
 {
-    EXPECT_NO_THROW(ParseJson(std::string(32, '[') + "0" + std::string(32, ']')));
-    EXPECT_THROW(ParseJson(std::string(33, '[') + "0" + std::string(33, ']')), TFailure);
-    EXPECT_NO_THROW(ParseJson(std::string(33, '[') + std::string(33, ']')));
-    EXPECT_THROW(ParseJson(std::string(34, '[') + std::string(34, ']')), TFailure);
+    EXPECT_NO_THROW(ParseJson(std::string(160, '[') + "0" + std::string(160, ']')));
+    EXPECT_THROW(ParseJson(std::string(161, '[') + "0" + std::string(161, ']')), TFailure);
+    EXPECT_NO_THROW(ParseJson(std::string(161, '[') + std::string(161, ']')));
+    EXPECT_THROW(ParseJson(std::string(162, '[') + std::string(162, ']')), TFailure);
     // Container start/end each count once, exactly like the original callback.
     std::string input = "[0";
     for (size_t i = 1; i < MaxJsonEvents - 2; ++i) {
@@ -222,5 +222,153 @@ TEST(Transport, RejectsInvalidUtf8AndMalformedJsonTokens)
     {
         EXPECT_ANY_THROW(ParseJson(input));
     }
+}
+
+TEST(Transport, ParsesCompoundPredicatesAndEnforcesLimitsAndErrorCodes)
+{
+    const SchemaSpec schema{{
+        {"key", FieldType::String, false},
+        {"n", FieldType::Int64, true},
+        {"f", FieldType::Float64, true},
+        {"b", FieldType::Bool, true},
+        {"t", FieldType::TimestampUsUtc, true},
+        {"s", FieldType::String, true},
+    }};
+
+    const auto compound = ParseScan("id", schema, ParseJson(R"({
+            "predicate": {
+                "op": "and",
+                "args": [
+                    {"op": "true"},
+                    {"op": "eq", "field": "key", "value": "k1"},
+                    {"op": "ne", "field": "n", "value": "10"},
+                    {"op": "lt", "field": "f", "value": -0.0},
+                    {"op": "le", "field": "b", "value": true},
+                    {"op": "gt", "field": "t", "value": "2026-01-01T00:00:00Z"},
+                    {"op": "ge", "field": "s", "value": null},
+                    {"op": "in", "field": "n", "values": []},
+                    {"op": "in", "field": "n", "values": ["1", null, "2"]},
+                    {"op": "is_null", "field": "s"},
+                    {"op": "is_not_null", "field": "n"},
+                    {"op": "or", "args": [
+                        {"op": "not", "arg": {"op": "eq", "field": "n", "value": null}},
+                        {"op": "true"}
+                    ]}
+                ]
+            }
+        })"));
+    EXPECT_EQ(compound.predicate.kind(), Predicate::Kind::And);
+    ASSERT_EQ(compound.predicate.children().size(), 12U);
+    EXPECT_EQ(compound.predicate.children()[3].value(), Literal{0.0});
+    EXPECT_EQ(compound.predicate.children()[6].kind(), Predicate::Kind::Compare);
+    EXPECT_FALSE(compound.predicate.children()[6].optional_value().has_value());
+
+    // Depth 64 compound predicate parses cleanly through both ParseJson (<= 160) and ParseScan (<= 64).
+    std::string depth64 = R"({"predicate":)";
+    for (int d = 0; d < 64; ++d) {
+        depth64 += R"({"op":"and","args":[)";
+    }
+    depth64 += R"({"op":"true"})";
+    for (int d = 0; d < 64; ++d) {
+        depth64 += "]}";
+    }
+    depth64 += "}";
+    EXPECT_NO_THROW(ParseScan("id", schema, ParseJson(depth64)));
+
+    auto expectFailure = [&](std::string_view body, int expectedStatus, std::string_view expectedCode) {
+        try {
+            (void)ParseScan("id", schema, ParseJson(body));
+            FAIL() << "Expected TFailure for: " << body;
+        } catch (const TFailure& error) {
+            EXPECT_EQ(ErrorStatus(error.Detail), expectedStatus) << body;
+            EXPECT_EQ(error.Detail.code, expectedCode) << body;
+            EXPECT_EQ(error.Detail.retry_hint,
+                expectedCode == "INVALID_ARGUMENT" ? RetryHint::FixInput : RetryHint::OperatorAction)
+                << body;
+        } catch (const std::exception& ex) {
+            FAIL() << "Expected TFailure, got std::exception: " << ex.what() << " for " << body;
+        }
+    };
+
+    // Malformed JSON shapes/types and invalid arguments -> 400 INVALID_ARGUMENT.
+    for (const std::string_view badInput : {
+             std::string_view{R"({"predicate":123})"},
+             std::string_view{R"({"predicate":[]})"},
+             std::string_view{R"({"predicate":{}})"},
+             std::string_view{R"({"predicate":{"op":123}})"},
+             std::string_view{R"({"predicate":{"op":"true","extra":1}})"},
+             std::string_view{R"({"predicate":{"op":"and"}})"},
+             std::string_view{R"({"predicate":{"op":"and","args":123}})"},
+             std::string_view{R"({"predicate":{"op":"and","args":[]}})"},
+             std::string_view{R"({"predicate":{"op":"or","args":[]}})"},
+             std::string_view{R"({"predicate":{"op":"and","args":[null]}})"},
+             std::string_view{R"({"predicate":{"op":"and","args":[123]}})"},
+             std::string_view{R"({"predicate":{"op":"and","args":[{"op":"true"}],"extra":1}})"},
+             std::string_view{R"({"predicate":{"op":"not"}})"},
+             std::string_view{R"({"predicate":{"op":"not","arg":null}})"},
+             std::string_view{R"({"predicate":{"op":"not","arg":123}})"},
+             std::string_view{R"({"predicate":{"op":"not","arg":{"op":"true"},"extra":1}})"},
+             std::string_view{R"({"predicate":{"op":"is_null"}})"},
+             std::string_view{R"({"predicate":{"op":"is_null","field":123}})"},
+             std::string_view{R"({"predicate":{"op":"is_null","field":"missing"}})"},
+             std::string_view{R"({"predicate":{"op":"is_null","field":"n","value":null}})"},
+             std::string_view{R"({"predicate":{"op":"in","field":"n"}})"},
+             std::string_view{R"({"predicate":{"op":"in","field":"n","values":123}})"},
+             std::string_view{R"({"predicate":{"op":"in","field":"n","values":["1"],"extra":1}})"},
+             std::string_view{R"({"predicate":{"op":"in","field":"n","values":[true]}})"},
+             std::string_view{R"({"predicate":{"op":"eq","field":"n"}})"},
+             std::string_view{R"({"predicate":{"op":"eq","field":"n","value":"1","extra":1}})"},
+             std::string_view{R"({"predicate":{"op":"eq","field":"n","value":true}})"},
+         })
+    {
+        expectFailure(badInput, 400, "INVALID_ARGUMENT");
+    }
+
+    // String byte caps: key > 1024 bytes and non-key string > 1 MiB -> 400 INVALID_ARGUMENT.
+    expectFailure(TJson({{"predicate", {{"op", "eq"}, {"field", "key"}, {"value", std::string(1025, 'k')}}}}).dump(),
+        400,
+        "INVALID_ARGUMENT");
+    expectFailure(TJson({{"predicate", {{"op", "in"}, {"field", "key"}, {"values", {std::string(1025, 'k')}}}}}).dump(),
+        400,
+        "INVALID_ARGUMENT");
+    expectFailure(
+        TJson({{"predicate", {{"op", "eq"}, {"field", "s"}, {"value", std::string(1024 * 1024 + 1, 's')}}}}).dump(),
+        400,
+        "INVALID_ARGUMENT");
+
+    // Depth 65 -> 400 INVALID_ARGUMENT even if leaf at depth 65 has an unknown op ("xor").
+    std::string depth65 = R"({"predicate":)";
+    for (int d = 0; d < 65; ++d) {
+        depth65 += R"({"op":"not","arg":)";
+    }
+    depth65 += R"({"op":"xor"})";
+    for (int d = 0; d < 65; ++d) {
+        depth65 += "}";
+    }
+    depth65 += "}";
+    expectFailure(depth65, 400, "INVALID_ARGUMENT");
+
+    // Nodes 1025 -> 400 INVALID_ARGUMENT.
+    TJson args1024 = TJson::array();
+    for (int i = 0; i < 1024; ++i) {
+        args1024.push_back({{"op", "true"}});
+    }
+    expectFailure(TJson({{"predicate", {{"op", "and"}, {"args", args1024}}}}).dump(), 400, "INVALID_ARGUMENT");
+
+    // Literals 4097 -> 400 INVALID_ARGUMENT.
+    TJson vals4097 = TJson::array();
+    for (int i = 0; i < 4097; ++i) {
+        vals4097.push_back("1");
+    }
+    expectFailure(TJson({{"predicate", {{"op", "in"}, {"field", "n"}, {"values", vals4097}}}}).dump(),
+        400,
+        "INVALID_ARGUMENT");
+
+    // Unknown op at depth <= 64 and empty projection -> 501 UNSUPPORTED_OPERATION.
+    expectFailure(R"({"predicate":{"op":"xor","args":[{"op":"true"}]}})", 501, "UNSUPPORTED_OPERATION");
+    expectFailure(R"({"predicate":{"op":"and","args":[{"op":"like","field":"key","value":"a%"}]}})",
+        501,
+        "UNSUPPORTED_OPERATION");
+    expectFailure(R"({"projection":[]})", 501, "UNSUPPORTED_OPERATION");
 }
 } // namespace glamdb::NTransport

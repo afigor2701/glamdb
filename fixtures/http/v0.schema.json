@@ -133,11 +133,8 @@
       ],
       "additionalProperties": false
     },
-    "predicate": {
+    "predicateNode": {
       "anyOf": [
-        {
-          "type": "null"
-        },
         {
           "type": "object",
           "properties": {
@@ -176,6 +173,97 @@
             "value"
           ],
           "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "in"
+            },
+            "field": {
+              "type": "string"
+            },
+            "values": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/cell"
+              }
+            }
+          },
+          "required": [
+            "op",
+            "field",
+            "values"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "enum": [
+                "is_null",
+                "is_not_null"
+              ]
+            },
+            "field": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "op",
+            "field"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "enum": [
+                "and",
+                "or"
+              ]
+            },
+            "args": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/predicateNode"
+              }
+            }
+          },
+          "required": [
+            "op",
+            "args"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "op": {
+              "const": "not"
+            },
+            "arg": {
+              "$ref": "#/$defs/predicateNode"
+            }
+          },
+          "required": [
+            "op",
+            "arg"
+          ],
+          "additionalProperties": false
+        }
+      ]
+    },
+    "predicate": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/predicateNode"
         }
       ]
     },

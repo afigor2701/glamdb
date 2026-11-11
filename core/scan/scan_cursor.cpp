@@ -408,13 +408,29 @@ private:
     // Filters, projects and applies the limit. Returns nullptr for no rows.
     std::shared_ptr<arrow::RecordBatch> Produce(const arrow::RecordBatch& batch)
     {
-        // Validate every decoded column before any value can be returned.
+        // Validate every decoded column before any value can be evaluated or returned.
+        std::vector<std::shared_ptr<arrow::Array>> readColumns;
+        readColumns.reserve(ReadFields_.size());
         for (const auto field : ReadFields_) {
-            ValidateColumn(Context_.Collection.schema.fields[field], *Column(batch, field));
+            auto col = Column(batch, field);
+            ValidateColumn(Context_.Collection.schema.fields[field], *col);
+            readColumns.push_back(std::move(col));
         }
+        const auto findReadColumn = [&](size_t field) -> const std::shared_ptr<arrow::Array>& {
+            const auto it = std::ranges::lower_bound(ReadFields_, field);
+            if (it == ReadFields_.end() || *it != field) {
+                Fail("INTERNAL", "read Parquet batch", "missing validated column");
+            }
+            return readColumns[static_cast<size_t>(it - ReadFields_.begin())];
+        };
         const auto selected = [&]() -> std::optional<std::vector<int64_t>> {
-            if (Predicate_.Kind == Predicate::Kind::Compare) {
-                auto rows = Take(SelectRows(Predicate_, *Column(batch, Predicate_.FieldIndex)));
+            if (!Predicate_.IsAlwaysTrue()) {
+                std::vector<std::shared_ptr<arrow::Array>> predicateColumns;
+                predicateColumns.reserve(Predicate_.ReferencedFields.size());
+                for (const auto field : Predicate_.ReferencedFields) {
+                    predicateColumns.push_back(findReadColumn(field));
+                }
+                auto rows = Take(SelectRows(Predicate_, batch.num_rows(), predicateColumns));
                 if (static_cast<int64_t>(rows.size()) != batch.num_rows()) {
                     return rows;
                 }
@@ -431,7 +447,7 @@ private:
         std::vector<std::shared_ptr<arrow::Array>> columns;
         columns.reserve(OutputFields_.size());
         for (const auto field : OutputFields_) {
-            auto array = Column(batch, field);
+            auto array = findReadColumn(field);
             if (selected) {
                 const auto rows = std::span<const int64_t>(*selected).first(static_cast<size_t>(count));
                 array = Take(TakeRows(*array, rows));
@@ -460,9 +476,7 @@ Result<std::shared_ptr<ScanCursor>> OpenScan(TScanContext context, const ScanReq
         auto predicate = Take(BindPredicate(request.predicate, schema));
 
         auto readFields = outputFields;
-        if (predicate.Kind == Predicate::Kind::Compare) {
-            readFields.push_back(predicate.FieldIndex);
-        }
+        readFields.insert(readFields.end(), predicate.ReferencedFields.begin(), predicate.ReferencedFields.end());
         std::ranges::sort(readFields);
         readFields.erase(std::unique(readFields.begin(), readFields.end()), readFields.end());
 

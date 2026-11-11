@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <variant>
@@ -45,52 +46,45 @@ enum class CompareOp : uint8_t { Eq, Ne, Lt, Le, Gt, Ge };
 
 // A literal must have exactly the field type: no implicit casts.
 using Literal = std::variant<std::string, bool, int64_t, double, TimestampUs>;
+using OptionalLiteral = std::optional<Literal>;
 
-// Supported: TRUE and one comparison of a field with a literal. A NULL cell
-// compares as UNKNOWN, so it is never returned. Strings use binary UTF-8 order.
+// SQL three-valued logic (True, False, Unknown) predicate tree; only rows
+// where the root evaluates to True are returned. Strings use binary UTF-8 order.
 class Predicate
 {
 public:
-    enum class Kind : uint8_t { True, Compare };
+    enum class Kind : uint8_t { True, Compare, In, IsNull, IsNotNull, And, Or, Not };
 
-    Predicate() = default;
+    Predicate() noexcept = default;
+    ~Predicate() noexcept;
+    Predicate(const Predicate&) noexcept = default;
+    Predicate& operator=(const Predicate&) noexcept = default;
+    Predicate(Predicate&&) noexcept = default;
+    Predicate& operator=(Predicate&&) noexcept = default;
 
-    static Predicate True()
-    {
-        return {};
-    }
-    static Predicate Compare(std::string field, CompareOp op, Literal value)
-    {
-        Predicate predicate;
-        predicate.kind_ = Kind::Compare;
-        predicate.field_ = std::move(field);
-        predicate.op_ = op;
-        predicate.value_ = std::move(value);
-        return predicate;
-    }
+    static Predicate True() noexcept;
+    static Predicate Compare(std::string field, CompareOp op, Literal value);
+    static Predicate CompareNull(std::string field, CompareOp op);
+    static Predicate In(std::string field, std::vector<OptionalLiteral> values);
+    static Predicate IsNull(std::string field);
+    static Predicate IsNotNull(std::string field);
+    static Predicate And(std::vector<Predicate> args);
+    static Predicate Or(std::vector<Predicate> args);
+    static Predicate Not(Predicate arg);
 
-    Kind kind() const
-    {
-        return kind_;
-    }
-    const std::string& field() const
-    {
-        return field_;
-    }
-    CompareOp op() const
-    {
-        return op_;
-    }
-    const Literal& value() const
-    {
-        return value_;
-    }
+    Kind kind() const noexcept;
+    const std::string& field() const noexcept;
+    CompareOp op() const noexcept;
+    const Literal& value() const noexcept;
+    const OptionalLiteral& optional_value() const noexcept;
+    std::span<const OptionalLiteral> values() const noexcept;
+    std::span<const Predicate> children() const noexcept;
 
 private:
-    Kind kind_ = Kind::True;
-    std::string field_;
-    CompareOp op_ = CompareOp::Eq;
-    Literal value_;
+    struct Node;
+    explicit Predicate(std::shared_ptr<const Node> node) noexcept;
+
+    std::shared_ptr<const Node> node_{};
 };
 
 struct ScanRequest

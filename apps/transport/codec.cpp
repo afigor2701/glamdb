@@ -1,5 +1,6 @@
 #include "apps/transport/codec.h"
 #include "core/api/canonical.h"
+#include "core/scan/predicate.h"
 
 #include <array>
 #include <charconv>
@@ -9,6 +10,7 @@
 
 namespace glamdb::NTransport {
 namespace {
+constexpr size_t MaxJsonDepth = 160;
 const std::vector<std::string> TypeNames{"string", "bool", "int64", "float64", "timestamp_us_utc"};
 
 // A single SAX pass constructs the DOM and rejects decoded duplicate keys.
@@ -85,8 +87,9 @@ private:
     size_t Nodes_ = 0;
     void Visit()
     {
-        // Accommodate all 10,000 rows of the maximum 256-field schema.
-        Require(Stack_.size() <= 32 && ++Nodes_ <= MaxJsonEvents, "JSON complexity limit exceeded");
+        // Accommodate all 10,000 rows of the maximum 256-field schema and
+        // depth-64 compound scan predicates.
+        Require(Stack_.size() <= MaxJsonDepth && ++Nodes_ <= MaxJsonEvents, "JSON complexity limit exceeded");
     }
     bool Start(TJson value)
     {
@@ -199,6 +202,177 @@ std::shared_ptr<arrow::Scalar> ParseScalar(FieldType type, const TJson& value)
             return std::make_shared<arrow::TimestampScalar>(ParseTimestamp(value), ArrowType(type));
     }
     throw TFailure({"INVALID_ARGUMENT", "unsupported scalar type"});
+}
+
+OptionalLiteral ParseOptionalLiteral(const FieldSpec& field, const TJson& value)
+{
+    if (value.is_null()) {
+        return std::nullopt;
+    }
+    const auto scalar = ParseScalar(field.type, value);
+    switch (field.type) {
+        case FieldType::String:
+            return Literal{scalar->ToString()};
+        case FieldType::Bool:
+            return Literal{static_cast<const arrow::BooleanScalar&>(*scalar).value};
+        case FieldType::Int64:
+            return Literal{static_cast<const arrow::Int64Scalar&>(*scalar).value};
+        case FieldType::Float64: {
+            const auto number = static_cast<const arrow::DoubleScalar&>(*scalar).value;
+            return Literal{number == 0.0 ? 0.0 : number};
+        }
+        case FieldType::TimestampUsUtc:
+            return Literal{TimestampUs{static_cast<const arrow::TimestampScalar&>(*scalar).value}};
+    }
+    throw TFailure({"INVALID_ARGUMENT", "unsupported literal type"});
+}
+
+const FieldSpec& FindPredicateField(const SchemaSpec& schema, std::string_view name)
+{
+    const auto it = std::ranges::find_if(schema.fields, [&](const auto& field) {
+        return field.name == name;
+    });
+    Require(it != schema.fields.end(), "unknown predicate field");
+    return *it;
+}
+
+Predicate ParsePredicateTree(const SchemaSpec& schema, const TJson& root)
+{
+    struct TParseFrame
+    {
+        const TJson* Json = nullptr;
+        size_t Depth = 0;
+        Predicate::Kind CombineKind = Predicate::Kind::True;
+        size_t ChildCount = 0;
+        bool Combine = false;
+    };
+
+    std::vector<TParseFrame> parseStack;
+    std::vector<Predicate> valueStack;
+    parseStack.push_back(TParseFrame{.Json = &root, .Depth = 0, .Combine = false});
+
+    size_t nodeCount = 1;
+    size_t literalCount = 0;
+
+    while (!parseStack.empty()) {
+        const auto frame = parseStack.back();
+        parseStack.pop_back();
+
+        if (frame.Combine) {
+            Require(valueStack.size() >= frame.ChildCount, "invalid predicate structure");
+            if (frame.CombineKind == Predicate::Kind::Not) {
+                auto arg = std::move(valueStack.back());
+                valueStack.pop_back();
+                valueStack.push_back(Predicate::Not(std::move(arg)));
+            } else {
+                const auto start = valueStack.size() - frame.ChildCount;
+                std::vector<Predicate> args;
+                args.reserve(frame.ChildCount);
+                for (size_t i = start; i < valueStack.size(); ++i) {
+                    args.push_back(std::move(valueStack[i]));
+                }
+                valueStack.erase(valueStack.begin() + static_cast<std::ptrdiff_t>(start), valueStack.end());
+                valueStack.push_back(frame.CombineKind == Predicate::Kind::And ? Predicate::And(std::move(args))
+                                                                               : Predicate::Or(std::move(args)));
+            }
+            continue;
+        }
+
+        const auto& node = *frame.Json;
+        Require(node.is_object(), "predicate must be an object");
+        Require(frame.Depth <= detail::MaxPredicateDepth, "predicate exceeds maximum depth");
+        Require(node.contains("op") && node["op"].is_string(), "predicate op must be a string");
+        const auto& op = node["op"].get_ref<const std::string&>();
+
+        if (op == "true") {
+            CheckKeys(node, {"op"});
+            valueStack.push_back(Predicate::True());
+            continue;
+        }
+        if (op == "and" || op == "or") {
+            CheckKeys(node, {"op", "args"});
+            Require(node.contains("args") && node["args"].is_array() && !node["args"].empty(),
+                "and/or predicate requires a non-empty args array");
+            const auto& args = node["args"];
+            Require(args.size() <= detail::MaxPredicateNodes - nodeCount, "predicate exceeds maximum node count");
+            nodeCount += args.size();
+            parseStack.push_back(TParseFrame{
+                .CombineKind = op == "and" ? Predicate::Kind::And : Predicate::Kind::Or,
+                .ChildCount = args.size(),
+                .Combine = true,
+            });
+            for (size_t i = args.size(); i > 0; --i) {
+                parseStack.push_back(TParseFrame{
+                    .Json = &args[i - 1],
+                    .Depth = frame.Depth + 1,
+                    .Combine = false,
+                });
+            }
+            continue;
+        }
+        if (op == "not") {
+            CheckKeys(node, {"op", "arg"});
+            Require(node.contains("arg"), "not predicate requires arg");
+            Require(nodeCount < detail::MaxPredicateNodes, "predicate exceeds maximum node count");
+            ++nodeCount;
+            parseStack.push_back(TParseFrame{
+                .CombineKind = Predicate::Kind::Not,
+                .ChildCount = 1,
+                .Combine = true,
+            });
+            parseStack.push_back(TParseFrame{
+                .Json = &node["arg"],
+                .Depth = frame.Depth + 1,
+                .Combine = false,
+            });
+            continue;
+        }
+        if (op == "is_null" || op == "is_not_null") {
+            CheckKeys(node, {"op", "field"});
+            Require(node.contains("field") && node["field"].is_string(), "predicate field must be a string");
+            const auto& name = node["field"].get_ref<const std::string&>();
+            (void)FindPredicateField(schema, name);
+            valueStack.push_back(op == "is_null" ? Predicate::IsNull(name) : Predicate::IsNotNull(name));
+            continue;
+        }
+        if (op == "in") {
+            CheckKeys(node, {"op", "field", "values"});
+            Require(node.contains("field") && node["field"].is_string(), "predicate field must be a string");
+            Require(node.contains("values") && node["values"].is_array(), "in predicate requires a values array");
+            const auto& name = node["field"].get_ref<const std::string&>();
+            const auto& field = FindPredicateField(schema, name);
+            const auto& rawValues = node["values"];
+            Require(rawValues.size() <= detail::MaxPredicateLiterals - literalCount,
+                "predicate exceeds maximum literal count");
+            literalCount += rawValues.size();
+            std::vector<OptionalLiteral> values;
+            values.reserve(rawValues.size());
+            for (const auto& item : rawValues) {
+                values.push_back(ParseOptionalLiteral(field, item));
+            }
+            valueStack.push_back(Predicate::In(name, std::move(values)));
+            continue;
+        }
+        const std::array<std::string_view, 6> comparisons{"eq", "ne", "lt", "le", "gt", "ge"};
+        const auto opIt = std::ranges::find(comparisons, op);
+        Require(opIt != comparisons.end(),
+            "unsupported predicate operator: " + detail::BoundedDiagnostic(op),
+            "UNSUPPORTED_OPERATION");
+        CheckKeys(node, {"op", "field", "value"});
+        Require(node.contains("field") && node["field"].is_string(), "predicate field must be a string");
+        Require(node.contains("value"), "comparison predicate requires value");
+        Require(literalCount < detail::MaxPredicateLiterals, "predicate exceeds maximum literal count");
+        ++literalCount;
+        const auto& name = node["field"].get_ref<const std::string&>();
+        const auto& field = FindPredicateField(schema, name);
+        const auto cmpOp = static_cast<CompareOp>(opIt - comparisons.begin());
+        auto literal = ParseOptionalLiteral(field, node["value"]);
+        valueStack.push_back(
+            literal ? Predicate::Compare(name, cmpOp, std::move(*literal)) : Predicate::CompareNull(name, cmpOp));
+    }
+
+    Require(valueStack.size() == 1, "invalid predicate structure");
+    return std::move(valueStack.back());
 }
 
 void CheckArrow(const arrow::Status& status)
@@ -335,8 +509,19 @@ ScanRequest ParseScan(std::string collectionID, const SchemaSpec& schema, const 
                                                                 : SnapshotSelector::Id(ParseInt64(value));
     }
     if (body.contains("projection") && !body["projection"].is_null()) {
-        result.projection = body["projection"].get<std::vector<std::string>>();
-        Require(!result.projection->empty(), "zero-column projection is unavailable", "UNSUPPORTED_OPERATION");
+        const auto& rawProjection = body["projection"];
+        Require(rawProjection.is_array(), "projection must be an array of field names");
+        Require(!rawProjection.empty(), "zero-column projection is unavailable", "UNSUPPORTED_OPERATION");
+        std::vector<std::string> fields;
+        fields.reserve(rawProjection.size());
+        for (const auto& item : rawProjection) {
+            Require(item.is_string(), "projection field name must be a string");
+            const auto& name = item.get_ref<const std::string&>();
+            (void)FindPredicateField(schema, name);
+            Require(std::ranges::find(fields, name) == fields.end(), "projection repeats a field");
+            fields.push_back(name);
+        }
+        result.projection = std::move(fields);
     }
     for (const auto key : {"limit", "batch_rows"}) {
         if (!body.contains(key)) {
@@ -355,42 +540,11 @@ ScanRequest ParseScan(std::string collectionID, const SchemaSpec& schema, const 
     if (!body.contains("predicate") || body["predicate"].is_null()) {
         return result;
     }
-    const auto& predicate = body["predicate"];
-    Require(predicate.is_object(), "predicate must be an object");
-    const auto op = predicate.at("op").get<std::string>();
-    if (op == "true") {
-        CheckKeys(predicate, {"op"});
-        return result;
+    result.predicate = ParsePredicateTree(schema, body["predicate"]);
+    const auto bound = detail::BindPredicate(result.predicate, schema);
+    if (!bound) {
+        throw TFailure(bound.error());
     }
-    const std::vector<std::string> operators{"eq", "ne", "lt", "le", "gt", "ge"};
-    const auto opIt = std::find(operators.begin(), operators.end(), op);
-    Require(opIt != operators.end(), "only one typed comparison is supported", "UNSUPPORTED_OPERATION");
-    CheckKeys(predicate, {"op", "field", "value"});
-    const auto name = predicate.at("field").get<std::string>();
-    const auto fieldIt = std::ranges::find_if(schema.fields, [&](const auto& field) {
-        return field.name == name;
-    });
-    Require(fieldIt != schema.fields.end(), "unknown predicate field");
-    const auto scalar = ParseScalar(fieldIt->type, predicate.at("value"));
-    Literal literal;
-    switch (fieldIt->type) {
-        case FieldType::String:
-            literal = scalar->ToString();
-            break;
-        case FieldType::Bool:
-            literal = static_cast<const arrow::BooleanScalar&>(*scalar).value;
-            break;
-        case FieldType::Int64:
-            literal = static_cast<const arrow::Int64Scalar&>(*scalar).value;
-            break;
-        case FieldType::Float64:
-            literal = static_cast<const arrow::DoubleScalar&>(*scalar).value;
-            break;
-        case FieldType::TimestampUsUtc:
-            literal = TimestampUs{static_cast<const arrow::TimestampScalar&>(*scalar).value};
-            break;
-    }
-    result.predicate = Predicate::Compare(name, static_cast<CompareOp>(opIt - operators.begin()), std::move(literal));
     return result;
 }
 

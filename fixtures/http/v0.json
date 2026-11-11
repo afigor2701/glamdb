@@ -265,7 +265,38 @@
         "identity": "object",
         "profile": "object"
       },
-      "request": {},
+      "request": {
+        "predicate": {
+          "op": "and",
+          "args": [
+            {
+              "op": "is_not_null",
+              "field": "key"
+            },
+            {
+              "op": "or",
+              "args": [
+                {
+                  "op": "in",
+                  "field": "key",
+                  "values": [
+                    "fixture",
+                    null
+                  ]
+                },
+                {
+                  "op": "not",
+                  "arg": {
+                    "op": "eq",
+                    "field": "key",
+                    "value": "other"
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      },
       "response_schema": "scanResult",
       "request_schema": "scan"
     },

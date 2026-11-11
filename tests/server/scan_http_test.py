@@ -22,6 +22,15 @@ class ScanHTTP(NativeHTTP):
             status, headers, _ = self.request(path + '/scan', {'snapshot_id': selector}, accept='application/vnd.apache.arrow.stream')
             self.assertEqual(status, 200)
             self.assertEqual(headers['X-GlamDB-Snapshot-Id'], expected or 'initial')
+        compound = {
+            'op': 'and',
+            'args': [
+                {'op': 'is_not_null', 'field': 'key'},
+                {'op': 'or', 'args': [{'op': 'in', 'field': 'key', 'values': ['a', None]}, {'op': 'eq', 'field': 'key', 'value': 'b'}]},
+                {'op': 'not', 'arg': {'op': 'eq', 'field': 'key', 'value': 'b'}},
+            ],
+        }
+        self.assertEqual(self.api(path + '/scan', {'projection': ['key'], 'predicate': compound})['rows'], [{'key': 'a'}])
 
     def test_scan_duplicate_pages_replay_cancel(self):
         path = self.collection()

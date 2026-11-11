@@ -175,6 +175,112 @@ TEST_F(EngineVerticalTest, FiltersProjectsAndLimits)
     EXPECT_TRUE(Drain(*none).empty());
 }
 
+TEST_F(EngineVerticalTest, CompoundPredicatesAcrossSnapshotsDuplicatesAndBatchSizes)
+{
+    const auto first = Committed(FirstOperation, FirstRows);
+    Committed(SecondOperation, SecondRows);
+
+    // FirstRows:
+    //   ("duplicate", 1, 0.5, true, 10)
+    //   ("duplicate", 1, 0.5, true, 10)
+    //   ("other", null, null, null, null)
+    // SecondRows:
+    //   ("duplicate", 2, -1.5, false, 20)
+    //   ("\xD0\xBA\xD0\xBB\xD1\x8E\xD1\x87", 3, 2.5, true, 30)
+    const auto compound = Predicate::Or({
+        Predicate::And({
+            Predicate::Compare("key", CompareOp::Eq, std::string("duplicate")),
+            Predicate::In("value", {int64_t{1}, std::nullopt}),
+            Predicate::Compare("score", CompareOp::Gt, 0.0),
+            Predicate::Compare("flag", CompareOp::Eq, true),
+        }),
+        Predicate::And({
+            Predicate::IsNull("value"),
+            Predicate::Not(Predicate::IsNotNull("at")),
+        }),
+    });
+
+    // Latest snapshot with projection = {"key"} (filtering on non-projected value, score, flag, at)
+    // and batch_rows = 1:
+    const auto cursor = Open({
+        .projection = std::vector<std::string>{"key"},
+        .predicate = compound,
+        .batch_rows = 1,
+    });
+    ASSERT_NE(cursor, nullptr);
+    EXPECT_EQ(cursor->Info().output_schema->num_fields(), 1);
+    EXPECT_EQ(Sorted(Drain(*cursor, 1)), Sorted({"duplicate", "duplicate", "other"}));
+
+    // Historical snapshot with NOT(value IN []): excludes NULL row ("other") under SQL 3VL!
+    EXPECT_EQ(Read({
+                  .selector = SnapshotSelector::Id(first.snapshot_id),
+                  .projection = std::vector<std::string>{"key"},
+                  .predicate = Predicate::Not(Predicate::In("value", {})),
+              }),
+        Sorted({"duplicate", "duplicate"}));
+
+    // CompareNull in Or with IsNull: Unknown OR True == True for row "other".
+    EXPECT_EQ(Read({
+                  .projection = std::vector<std::string>{"key"},
+                  .predicate = Predicate::Or({
+                      Predicate::CompareNull("value", CompareOp::Eq),
+                      Predicate::IsNull("score"),
+                  }),
+              }),
+        Sorted({"other"}));
+}
+
+TEST_F(EngineVerticalTest, InvalidCompoundPredicatesPreserveReadinessAndFilteredBuffersRetainStoreLease)
+{
+    Committed(FirstOperation, FirstRows);
+    Committed(SecondOperation, SecondRows);
+
+    // Invalid compound predicates fail with INVALID_ARGUMENT without latching engine readiness.
+    for (const auto& bad : {
+             Predicate::And({}),
+             Predicate::Or({}),
+             Predicate::And({Predicate::True(), Predicate::Compare("missing", CompareOp::Eq, int64_t{1})}),
+             Predicate::In("value", {int64_t{1}, 2.5}),
+         })
+    {
+        const auto res = Engine_->Scan({.collection_id = test::collection_id, .predicate = bad});
+        ASSERT_FALSE(res);
+        EXPECT_EQ(res.error().code, "INVALID_ARGUMENT");
+        const auto health = Engine_->GetHealth();
+        EXPECT_TRUE(health.read_available);
+        EXPECT_TRUE(health.write_ready);
+    }
+
+    // Filtered buffers (via TakeRows) must retain StoreLease after cursor and Engine are released.
+    auto cursor = Open({
+        .projection = std::vector<std::string>{"key"},
+        .predicate = Predicate::And({
+            Predicate::IsNotNull("value"),
+            Predicate::Compare("value", CompareOp::Ge, int64_t{2}),
+        }),
+    });
+    ASSERT_NE(cursor, nullptr);
+    auto batch = cursor->Next();
+    ASSERT_TRUE(batch);
+    ASSERT_NE(*batch, nullptr);
+    EXPECT_EQ((*batch)->num_rows(), 2);
+
+    auto slice = (*batch)->column(0)->Slice(0, 1);
+    batch = std::shared_ptr<arrow::RecordBatch>{};
+    cursor.reset();
+    ASSERT_TRUE(Engine_->Shutdown(1000ms));
+    Engine_.reset();
+
+    const auto locked = OpenExisting({Root_.string(), test::store_id});
+    ASSERT_FALSE(locked);
+    EXPECT_EQ(locked.error().code, "STATE_IN_USE");
+
+    slice.reset();
+    auto reopened = OpenExisting({Root_.string(), test::store_id});
+    ASSERT_TRUE(reopened) << reopened.error().code << ": " << reopened.error().message;
+    Engine_ = *reopened;
+}
+
 TEST_F(EngineVerticalTest, RejectsInvalidScans)
 {
     const auto code = [&](const ScanRequest& request) {

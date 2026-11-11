@@ -36,6 +36,21 @@ void Check(bool condition, std::string_view message)
     }
 }
 
+glamdb::Predicate CompoundDupPredicate()
+{
+    const auto predicate = glamdb::Predicate::And({
+        glamdb::Predicate::Compare("key", glamdb::CompareOp::Eq, std::string("dup")),
+        glamdb::Predicate::Or({
+            glamdb::Predicate::In("n", {int64_t{1}, std::nullopt}),
+            glamdb::Predicate::Not(glamdb::Predicate::IsNotNull("n")),
+            glamdb::Predicate::CompareNull("n", glamdb::CompareOp::Eq),
+        }),
+    });
+    Check(predicate.kind() == glamdb::Predicate::Kind::And && predicate.children().size() == 2U,
+        "compound predicate AST accessors");
+    return predicate;
+}
+
 template <class T>
 T Take(glamdb::Result<T> result, std::string_view context)
 {
@@ -128,6 +143,12 @@ void CheckViews(glamdb::Engine& engine, int64_t snapshotA, int64_t snapshotB)
     CheckScan(engine, glamdb::SnapshotSelector::Latest(), RowsAB, glamdb::SnapshotSelector::Id(snapshotB));
     CheckScan(engine, glamdb::SnapshotSelector::Id(snapshotA), RowsA, glamdb::SnapshotSelector::Id(snapshotA));
     CheckScan(engine, glamdb::SnapshotSelector::InitialEmpty(), {}, glamdb::SnapshotSelector::InitialEmpty());
+    auto filtered = Take(engine.Scan({.collection_id = CollectionId,
+                             .selector = glamdb::SnapshotSelector::Id(snapshotB),
+                             .predicate = CompoundDupPredicate(),
+                             .batch_rows = 1}),
+        "compound filtered scan");
+    CheckRows(*filtered, {{"dup", 1}, {"dup", 1}}, glamdb::SnapshotSelector::Id(snapshotB));
 }
 
 void Write(glamdb::Engine& engine, const std::string& receiptPath)
@@ -199,7 +220,7 @@ void CheckUnavailable(glamdb::Engine& engine)
             appended.phase == glamdb::CommitPhase::Validation && !appended.result && !appended.recovery &&
             appended.error && appended.error->code == "DEPENDENCY_UNAVAILABLE",
         "storage-disabled append must report DEPENDENCY_UNAVAILABLE before binding");
-    const auto scan = engine.Scan({.collection_id = CollectionId});
+    const auto scan = engine.Scan({.collection_id = CollectionId, .predicate = CompoundDupPredicate()});
     Check(!scan && scan.error().code == "DEPENDENCY_UNAVAILABLE", "storage-disabled scan dependency error");
     Check(Take(engine.ListCollections(), "list storage-disabled collections").empty(), "no fabricated collection");
     const auto outcome = engine.FindAppendOutcome(CollectionId, OperationA);

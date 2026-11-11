@@ -143,29 +143,40 @@ joins a writer attempt or holds a SQLite read transaction.
   `Next()` (still `CORRUPTION`, closing readiness). Warehouse directories are
   never listed. Delete manifests,
   partitioned specs and non-Parquet files are `UNSUPPORTED_TABLE_FEATURE`.
-- `Predicate` supports `True` and one comparison (`Eq`, `Ne`, `Lt`, `Le`, `Gt`,
-  `Ge`) of a field with a literal of exactly the field type. A NULL cell is
-  UNKNOWN and never returned, which equals SQL three-valued logic for a single
-  comparison. Strings compare by unsigned UTF-8 bytes; literal `-0.0` matches
-  stored `0.0`; NaN/Inf and out-of-range timestamps are `INVALID_ARGUMENT`.
+- `Predicate` supports `True`, comparisons (`Eq`, `Ne`, `Lt`, `Le`, `Gt`, `Ge`)
+  of a field with a literal of the exact field type or an explicit `NULL`
+  (`CompareNull`), `In` with an array of optional literals (`std::nullopt` for
+  SQL `NULL`), `IsNull`, `IsNotNull`, and recursive `And`, `Or`, `Not` trees
+  (depth `<= 64`, nodes `<= 1024`, literals `<= 4096`; empty `And`/`Or`
+  children are `INVALID_ARGUMENT`). Evaluation uses full SQL three-valued logic
+  (`False`, `True`, `Unknown`): a `NULL` cell or `NULL` comparison literal yields
+  `Unknown`, `In` with an empty list yields `False` for non-`NULL` cells (and
+  `Unknown` for `NULL` cells), `In` with `NULL` yields `True` on a match and
+  `Unknown` on a non-match, `False AND Unknown == False`, `True OR Unknown ==
+  True`, `NOT Unknown == Unknown`, and only `== True` at the root survives.
+  Strings compare by unsigned UTF-8 bytes (`key` literals `<= 1024` bytes, other
+  strings `<= 1 MiB`); literal `-0.0` normalizes to `0.0`; NaN/Inf and
+  out-of-range timestamps are `INVALID_ARGUMENT`.
 - Each file is read whole (at most 32 MiB in this profile) and its footer is
   checked by the same verifier as recovery: exact field IDs 1..N, names,
   repetition, physical/logical types, row group counts and the manifest row
-  count. Before any value is returned, every decoded column is validated:
-  Arrow `ValidateFull` (offsets and UTF-8), string limits (1024 bytes for
-  `key`, 1 MiB otherwise), finite non-negative-zero floats and timestamps in
-  years 0001..9999. Then rows are filtered, projected and limited. Batches have at most
-  `batch_rows` rows and the exact `Info().output_schema`. `limit = 0` and empty
-  views return `nullptr` from the first `Next()`.
+  count. All columns referenced by `projection` and `predicate` are deduplicated
+  and read from Parquet; before `SelectRows` evaluates the predicate or any
+  value is returned, every decoded projection and filter-only column is
+  validated: Arrow `ValidateFull` (offsets and UTF-8), string limits (1024 bytes
+  for `key`, 1 MiB otherwise), finite non-negative-zero floats and timestamps in
+  years 0001..9999. Then rows are filtered in bounded strips, projected (dropping
+  non-projected filter columns) and limited. Batches have at most `batch_rows`
+  rows and the exact `Info().output_schema`. `limit = 0` and empty views return
+  `nullptr` from the first `Next()`.
 - Both the cursor and returned Arrow buffers retain the store lease until the
   last dependent handle (including array slices and C Data exports) is
   released. `Cancel()` or `Engine::Shutdown()` makes `Next()` return
   `CANCELLED`; `Info()` remains valid. Detected corruption during `Next()`
   closes engine readiness. Read failures are errors, never EOS.
 
-Not implemented: file/row-group pruning, compound predicates (`And`, `Or`,
-`Not`, `In`, `IsNull`), reuse of the backend's parsed root by scans,
-runtime memory leases and quotas,
+Not implemented: file/row-group pruning, reuse of the backend's parsed root by
+scans, runtime memory leases and quotas,
 page CRC verification, per-device physical/inode budgets and in-flight
 reservations, and measured attempt-volume/capacity qualification.
 The [shared resource budget contract](RESOURCE_BUDGETS.md) defines the required
@@ -176,12 +187,13 @@ of reader, writer, metadata and recovery reservations.
 
 | Check | Status |
 | --- | --- |
-| `cmake --build --preset local` (Clang 18.1.3, `GLAMDB_BUILD_STORAGE=ON`) and `format-check`, `quality-negative-check` | PASS |
-| `ctest --preset local` (unit, mock, vertical, fault, integration including `glamdb.scan_process`, installed consumer, tooling, smoke) | PASS, see the PR description for counts; the standalone `RecoveryChildProcess` helper is skipped as expected |
-| `glamdb_vertical` (`engine_vertical_test.cpp`, `engine_integrity_test.cpp`) | PASS: commit-gate boundaries, layout violations, retry verification, crafted same-length Parquet corruption, quotas, write latch |
-| `glamdb_mock` (label `mock`, in-memory FileIO) | PASS, also from a read-only working/temporary directory |
-| Separate `GLAMDB_BUILD_STORAGE=OFF` build and CTest | PASS |
-| Full-repo `tidy-check`, sanitizer presets, TSan, power-loss qualification | NOT RUN in this change |
+| `cmake --build --preset local` (Clang 18.1.3, `GLAMDB_BUILD_STORAGE=ON`) and `format-check` | PASS |
+| `ctest --preset local` (unit `ScanPredicate.*`, mock `ScanMockTest.*`, vertical `EngineVerticalTest.*`, `glamdb.scan_process`, `glamdb.transport.*`, `glamdb.native_http`, `glamdb.http_review`, `glamdb.native_http_fault`, installed consumer) | PASS |
+| `glamdb_vertical` (`engine_vertical_test.cpp`, `engine_integrity_test.cpp`) | PASS: commit-gate boundaries, layout violations, retry verification, crafted same-length Parquet corruption (including filter-only columns), compound 3VL predicates across multiple Parquet files, quotas, write latch |
+| `glamdb_mock` (label `mock`, in-memory FileIO) | PASS, including compound 3VL truth tables, De Morgan laws with `NULL`, multi-column filter-only validation, and read-only working/temporary directory |
+| Separate `GLAMDB_BUILD_STORAGE=OFF` build (`build/nostorage`) and CTest (`ScanPredicate.*`, `Transport.*`, `installed_consumer`, `EngineBootstrap.*`) | PASS |
+| `tests/verification/test_oracle.py` against `glamdb_verify` | PASS |
+| `tidy-check`, sanitizer presets, TSan, Python `pytest`/`httpx`/`pyarrow`/`jsonschema` client & schema runner, Node/Playwright workbench checks, power-loss qualification | NOT RUN in this environment |
 
 Value validation reads only decoded columns of the projection and predicate;
 latent corruption in unread columns or unread data pages is not detected by

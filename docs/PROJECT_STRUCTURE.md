@@ -125,7 +125,7 @@ files for every anticipated module. The intended responsibilities are:
 The public facade and catalog/coordinator are implemented. With
 `GLAMDB_BUILD_STORAGE` (default unless IO-only), `core/backend/` installs the real
 storage backend behind `core/engine/storage_backend.h` and `core/scan/` serves
-`Engine::Scan` without pruning or compound predicates. Installed public headers work without private headers.
+`Engine::Scan` with compound SQL three-valued predicates (without file/row-group pruning). Installed public headers work without private headers.
 `GLAMDB_IO_ONLY=ON` builds independent I/O without the engine or CLI; the default
 full build preserves the installed `glamdb::core` package.
 Transport, SDK, and UI dependencies stay outside `public/storage/` and `core/`;

@@ -254,10 +254,16 @@ fractional digits, normalized to UTC with six digits, years 0001–9999.
 Scan: `{projection?,predicate?,snapshot_id?,limit?,batch_rows?}`. Omission selects
 latest once; null or `"initial"` selects the initial empty view. Historical IDs
 are decimal strings. Omitted/null projection defaults to all columns; zero-column projection
-is unavailable. Predicates are null/`{op:"true"}` or one comparison
-`{op:"eq|ne|lt|le|gt|ge",field,value}` with a correctly typed literal. Other
-operators return 501. Limit is a nonnegative int64 integer; batch_rows is 1..65536.
-Only TRUE survives NULL filtering. No SQL parser is implied.
+is unavailable. Predicates are `null`/`{op:"true"}`, comparisons
+`{op:"eq|ne|lt|le|gt|ge",field,value}` (where `value` is a correctly typed
+literal or `null`), `{op:"in",field,values:[...]}` (typed literals and/or
+`null`), `{op:"is_null|is_not_null",field}`, or recursive boolean trees
+`{op:"and|or",args:[...]}` (non-empty `args`) and `{op:"not",arg:{...}}` within
+`predicate_depth <= 64`, `predicate_nodes <= 1024`, and `predicate_literals <=
+4096` (exceeding limits or malformed shapes/types returns 400; unknown operators
+within the depth limit return 501). Limit is a nonnegative int64 integer;
+batch_rows is 1..65536. SQL three-valued NULL logic applies across the tree and
+only TRUE at the root survives. No SQL parser is implied.
 
 JSON scan returns `{schema,snapshot_id,rows,identity,profile,next_cursor}`. The
 snapshot is the resolved selected view, including null for the initial empty

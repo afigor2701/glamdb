@@ -17,6 +17,10 @@ def _compile(predicate, fields, depth=0):
     op = predicate.get("op")
     if not isinstance(op, str):
         raise ValueError("predicate op required")
+    if op == "true":
+        if set(predicate) != {"op"}:
+            raise ValueError("true predicate takes no arguments")
+        return lambda row: True
     if op in ("and", "or"):
         args = predicate.get("args")
         if set(predicate) != {"op", "args"} or not isinstance(args, list) or not args:

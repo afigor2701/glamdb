@@ -260,10 +260,19 @@ class NativeHTTP(unittest.TestCase):
         caps = self.api('/capabilities')
         self.assertFalse(caps['mock'])
         self.assertEqual(caps['backend'], 'local')
+        self.assertEqual(
+            caps['predicate_ops'],
+            ['true', 'eq', 'ne', 'lt', 'le', 'gt', 'ge', 'in', 'is_null', 'is_not_null', 'and', 'or', 'not'],
+        )
+        self.assertEqual(caps['limits']['predicate_depth'], 64)
+        self.assertEqual(caps['limits']['predicate_nodes'], 1024)
+        self.assertEqual(caps['limits']['predicate_literals'], 4096)
         path = self.collection()
         for value in [1, True, '9223372036854775808']:
             self.api(path + '/append', {'operation_id': str(uuid.uuid4()), 'rows': [{'key': 'a', 'n': value}]}, status=400)
-        self.api(path + '/scan', {'predicate': {'op': 'is_null', 'field': 'n'}}, status=501)
+        self.assertEqual(self.api(path + '/scan', {'predicate': {'op': 'is_null', 'field': 'n'}})['rows'], [])
+        self.api(path + '/scan', {'predicate': {'op': 'and', 'args': []}}, status=400)
+        self.api(path + '/scan', {'predicate': {'op': 'xor', 'args': [{'op': 'true'}]}}, status=501)
         self.api(path + '/snapshots', status=501)
         self.api(path + '/files', status=501)
         self.api(path + '/stats', status=501)
@@ -404,7 +413,7 @@ class NativeHTTP(unittest.TestCase):
 
     def test_raw_json_and_response_diagnostics_are_bounded(self):
         for wire in (b'{', b'[]', b'{"name":"a","name":"b"}', b'{"name":"\xff"}',
-                     b'{"name":' + b'[' * 34 + b'0' + b']' * 34 + b'}'):
+                     b'{"name":' + b'[' * 161 + b'0' + b']' * 161 + b'}'):
             conn = http.client.HTTPConnection('127.0.0.1', self.port, timeout=10)
             conn.request('POST', '/databases', wire,
                          {'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json'})
@@ -547,6 +556,107 @@ class NativeHTTP(unittest.TestCase):
                 for name, kind in route['response_fields'].items():
                     self.assertIn(name, value)
                     self.assertIn(type(value[name]), tuple(kinds[item] for item in kind.split('|')))
+
+    def test_compound_predicates_and_oracle_equivalence(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tools/verification/src'))
+        from glamdb_verify import scan_rows, wire_rows
+
+        cid = str(uuid.uuid4())
+        schema = {
+            'fields': [
+                {'name': 'key', 'type': 'string', 'nullable': False},
+                {'name': 'id', 'type': 'int64', 'nullable': False},
+                {'name': 'a', 'type': 'bool', 'nullable': True},
+                {'name': 'b', 'type': 'bool', 'nullable': True},
+                {'name': 'n', 'type': 'int64', 'nullable': True},
+                {'name': 'f', 'type': 'float64', 'nullable': True},
+                {'name': 's', 'type': 'string', 'nullable': True},
+            ]
+        }
+        self.api('/collections', {'collection_id': cid, 'name': 'oracle_3vl', 'schema': schema})
+        path = '/collections/' + cid
+        tri = [True, None, False]
+        ns = [None, 1, 2, 2, -5, None, 1, 3, 0]
+        fs = [-0.0, 0.0, 1.5, None, -2.5, 0.0, None, 3.25, -0.0]
+        ss = [None, 'one', 'two', 'two', 'neg', None, 'one', 'three', 'zero']
+        oracle_rows = []
+        for idx, (av, bv) in enumerate((a, b) for a in tri for b in tri):
+            oracle_rows.append({
+                'key': f'k{idx}',
+                'id': idx,
+                'a': av,
+                'b': bv,
+                'n': ns[idx],
+                'f': fs[idx],
+                's': ss[idx],
+            })
+        self.api(path + '/append', {'operation_id': str(uuid.uuid4()), 'rows': wire_rows(schema, oracle_rows)})
+
+        pred_a = {'op': 'eq', 'field': 'a', 'value': True}
+        pred_b = {'op': 'eq', 'field': 'b', 'value': True}
+        predicates = [
+            None,
+            {'op': 'true'},
+            {'op': 'not', 'arg': {'op': 'true'}},
+            {'op': 'and', 'args': [pred_a, pred_b]},
+            {'op': 'or', 'args': [pred_a, pred_b]},
+            {'op': 'not', 'arg': {'op': 'and', 'args': [pred_a, pred_b]}},
+            {'op': 'or', 'args': [{'op': 'not', 'arg': pred_a}, {'op': 'not', 'arg': pred_b}]},
+            {'op': 'not', 'arg': {'op': 'or', 'args': [pred_a, pred_b]}},
+            {'op': 'and', 'args': [{'op': 'not', 'arg': pred_a}, {'op': 'not', 'arg': pred_b}]},
+            {'op': 'in', 'field': 'n', 'values': []},
+            {'op': 'not', 'arg': {'op': 'in', 'field': 'n', 'values': []}},
+            {'op': 'in', 'field': 'n', 'values': ['1', None]},
+            {'op': 'not', 'arg': {'op': 'in', 'field': 'n', 'values': ['1', None]}},
+            {'op': 'in', 'field': 'n', 'values': ['1', '2']},
+            {'op': 'not', 'arg': {'op': 'in', 'field': 'n', 'values': ['1', '2']}},
+            {'op': 'eq', 'field': 'n', 'value': None},
+            {'op': 'not', 'arg': {'op': 'eq', 'field': 'n', 'value': None}},
+            {'op': 'is_null', 'field': 'n'},
+            {'op': 'is_not_null', 'field': 'n'},
+            {'op': 'eq', 'field': 'f', 'value': -0.0},
+            {'op': 'in', 'field': 'f', 'values': [-0.0]},
+            {
+                'op': 'and',
+                'args': [
+                    {'op': 'true'},
+                    {
+                        'op': 'or',
+                        'args': [
+                            {'op': 'is_null', 'field': 's'},
+                            {'op': 'in', 'field': 'n', 'values': ['1', '3']},
+                        ],
+                    },
+                    {'op': 'not', 'arg': {'op': 'eq', 'field': 'b', 'value': False}},
+                ],
+            },
+        ]
+        for pred in predicates:
+            with self.subTest(predicate=pred):
+                expected = wire_rows(
+                    {'fields': [{'name': 'key', 'type': 'string', 'nullable': False},
+                                {'name': 'id', 'type': 'int64', 'nullable': False}]},
+                    scan_rows(schema, oracle_rows, ['key', 'id'], pred),
+                )
+                actual = self.api(path + '/scan', {'projection': ['key', 'id'], 'predicate': pred})['rows']
+                self.assertEqual(actual, expected)
+                opened = self.api(path + '/scan/open', {'projection': ['key', 'id'], 'predicate': pred, 'batch_rows': 2})
+                paged = []
+                cursor = opened['cursor']
+                while cursor:
+                    page = self.api(path + '/scan', {'cursor': cursor})
+                    paged.extend(page['rows'])
+                    cursor = page['next_cursor']
+                self.assertEqual(paged, expected)
+
+        depth_64 = {'op': 'true'}
+        for _ in range(64):
+            depth_64 = {'op': 'and', 'args': [depth_64]}
+        self.assertEqual(len(self.api(path + '/scan', {'projection': ['id'], 'predicate': depth_64})['rows']), 9)
+        depth_65 = {'op': 'not', 'arg': depth_64}
+        err_65 = self.api(path + '/scan', {'projection': ['id'], 'predicate': depth_65}, status=400)['error']
+        self.assertEqual(err_65['code'], 'INVALID_ARGUMENT')
+        self.assertEqual(err_65['retry_hint'], 'FixInput')
 
     def test_sdk_json_and_arrow(self):
         sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'sdk/python/src'))
