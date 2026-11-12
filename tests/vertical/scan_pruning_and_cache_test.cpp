@@ -2,12 +2,23 @@
 // and bounded immutable metadata/manifest/footer caching.
 
 #include "core/scan/metadata_cache.h"
+#include "core/storage/format_verifier.h"
+#include "storage/resources.h"
 #include "tests/support/fault_fs.h"
 #include "tests/vertical/vertical_support.h"
 
 #include <arrow/api.h>
 #include <arrow/io/memory.h>
+#include <iceberg/arrow/arrow_io_util.h>
+#include <iceberg/manifest/manifest_entry.h>
+#include <iceberg/manifest/manifest_list.h>
+#include <iceberg/manifest/manifest_reader.h>
+#include <iceberg/manifest/manifest_writer.h>
+#include <iceberg/snapshot.h>
+#include <iceberg/table_metadata.h>
 #include <parquet/arrow/reader.h>
+#include <parquet/file_reader.h>
+#include <parquet/statistics.h>
 
 #include <algorithm>
 #include <chrono>
@@ -937,6 +948,12 @@ TEST_F(ScanPruningVerticalTest, MalformedOnDiskParquetFooterStatsPruneNothingAnd
         EXPECT_TRUE(health.read_available);
         EXPECT_TRUE(health.write_ready);
     }
+
+    // GetFileDetails and Reconcile must also keep the store healthy on contradictory bounds.
+    const auto invertedDetails = Engine_->GetFileDetails(test::collection_id, listing->Files.front().FileID);
+    ASSERT_TRUE(invertedDetails) << invertedDetails.error().message;
+    EXPECT_TRUE(Engine_->GetHealth().read_available);
+    EXPECT_TRUE(Engine_->Reconcile());
 }
 
 namespace {
@@ -1487,6 +1504,560 @@ TEST_F(ScanPruningVerticalTest, ByteExactParquetPReadAccountingAndColumnChunkEno
         });
         ASSERT_TRUE(retry) << retry.error().message;
         EXPECT_EQ(DrainRendered(**retry), (std::vector<std::string>{"io-0", "io-1", "io-2", "io-3"}));
+    }
+}
+
+TEST_F(ScanPruningVerticalTest, StructuralFooterCorruptionInUnreadColumnFailsScanAvoidsCacheAndBlocksReconcile)
+{
+    CreateEngine();
+    const auto cache = StorageBackend_->ReadMetadataCache();
+    ASSERT_NE(cache, nullptr);
+
+    ASSERT_EQ(Engine_
+                  ->AppendDurable({test::collection_id,
+                      FirstOperation,
+                      {},
+                      {MakePruningBatch({
+                          {"k0", "lbl-0", 10, 1.0, true, 100, std::nullopt},
+                          {"k1", std::nullopt, 20, 2.0, false, 200, "p1"},
+                          {"k2", "lbl-2", 30, 3.0, true, 300, "p2"},
+                      })}})
+                  .disposition,
+        CommitDisposition::Committed);
+
+    const auto listing = Engine_->ListFiles(test::collection_id);
+    ASSERT_TRUE(listing) << listing.error().message;
+    ASSERT_EQ(listing->Files.size(), 1U);
+    const auto fileId = listing->Files.front().FileID;
+    const auto details = Engine_->GetFileDetails(test::collection_id, fileId);
+    ASSERT_TRUE(details) << details.error().message;
+
+    const auto path = FilesIn(Root_ / "warehouse" / test::collection_id / "data").front();
+    const std::string original = ReadBytes(path);
+    const size_t footerStart = original.size() - static_cast<size_t>(details->FooterBytes) - 8U;
+
+    // Locate ColumnMetaData for column 1 ("label"): path_in_schema (`\x19\x18\x05label`),
+    // followed by codec (`\x15` + varint) and num_values (`\x16\x06` for zigzag(3) == 6).
+    const size_t labelPath = original.find(std::string("\x19\x18\x05") + "label", footerStart);
+    ASSERT_NE(labelPath, std::string::npos);
+    const size_t numValuesField = original.find(std::string("\x16\x06"), labelPath + 8);
+    ASSERT_NE(numValuesField, std::string::npos);
+
+    // Case 1: Structural corruption (`num_values` 3 -> 4) in unread column 1 ("label").
+    {
+        std::string damaged = original;
+        damaged[numValuesField + 1] = '\x08'; // zigzag(4) == 8
+        WriteBytes(path, damaged);
+
+        const auto parsed = parquet::ParquetFileReader::OpenFile(path.string())->metadata();
+        EXPECT_EQ(parsed->RowGroup(0)->ColumnChunk(0)->num_values(), 3);
+        EXPECT_EQ(parsed->RowGroup(0)->ColumnChunk(1)->num_values(), 4);
+
+        cache->Clear();
+        const auto cursor = Engine_->Scan({
+            .collection_id = test::collection_id,
+            .projection = std::vector<std::string>{"key"},
+        });
+        ASSERT_TRUE(cursor) << cursor.error().message;
+        const auto batch = (*cursor)->Next();
+        ASSERT_FALSE(batch);
+        EXPECT_EQ(batch.error().code, "CORRUPTION") << batch.error().message;
+        EXPECT_EQ(cache->Stats().FooterEntries, 0U);
+        EXPECT_FALSE(Engine_->GetHealth().read_available);
+        EXPECT_FALSE(Engine_->GetHealth().write_ready);
+
+        // Reconcile without repairing the file must also reject the broken footer (no livelock).
+        const auto reconciled = Engine_->Reconcile();
+        ASSERT_FALSE(reconciled);
+        EXPECT_EQ(reconciled.error().code, "CORRUPTION") << reconciled.error().message;
+        EXPECT_FALSE(Engine_->GetHealth().read_available);
+
+        WriteBytes(path, original);
+        ASSERT_TRUE(Engine_->Reconcile());
+        EXPECT_TRUE(Engine_->GetHealth().read_available);
+    }
+
+    // Case 2: Structural corruption (`data_page_offset` / `dictionary_page_offset` < 4) in unread column 1 ("label").
+    {
+        const auto origMeta = parquet::ParquetFileReader::OpenFile(path.string())->metadata();
+        const auto chunk1 = origMeta->RowGroup(0)->ColumnChunk(1);
+        const int64_t targetOffset =
+            chunk1->has_dictionary_page() ? chunk1->dictionary_page_offset() : chunk1->data_page_offset();
+        ASSERT_GE(targetOffset, 4);
+        // Find the 1- or 2-byte zigzag varint of targetOffset after total_compressed_size in column 1.
+        const uint64_t zz = static_cast<uint64_t>(targetOffset) << 1U;
+        std::string encodedOffset;
+        uint64_t rem = zz;
+        while (rem >= 0x80U) {
+            encodedOffset.push_back(static_cast<char>((rem & 0x7fU) | 0x80U));
+            rem >>= 7U;
+        }
+        encodedOffset.push_back(static_cast<char>(rem));
+        // Replace with same-byte-width varint encoding zigzag(1) == 2 (padded with 0x80 continuation if 2 bytes).
+        std::string invalidOffset;
+        if (encodedOffset.size() == 1U) {
+            invalidOffset.push_back('\x04'); // zigzag(2) -> offset 2 < 4
+        } else {
+            ASSERT_EQ(encodedOffset.size(), 2U);
+            invalidOffset.push_back('\x84'); // low 7 bits = 4, continuation = 1
+            invalidOffset.push_back('\x00'); // high bits = 0 -> zigzag(2) -> offset 2 < 4
+        }
+        // Both field 9 (data_page_offset after field 7) and field 11 (dictionary_page_offset after field 9)
+        // have Compact Thrift field-id delta 2 (`\x26`).
+        const size_t offsetField = original.find(std::string(1, '\x26') + encodedOffset, numValuesField + 2);
+        ASSERT_NE(offsetField, std::string::npos);
+
+        std::string damaged = original;
+        damaged.replace(offsetField + 1, invalidOffset.size(), invalidOffset);
+        WriteBytes(path, damaged);
+
+        const auto parsed = parquet::ParquetFileReader::OpenFile(path.string())->metadata();
+        const auto alteredChunk1 = parsed->RowGroup(0)->ColumnChunk(1);
+        const int64_t alteredOffset = alteredChunk1->has_dictionary_page() ? alteredChunk1->dictionary_page_offset()
+                                                                           : alteredChunk1->data_page_offset();
+        EXPECT_EQ(alteredOffset, 2);
+
+        cache->Clear();
+        const auto cursor = Engine_->Scan({
+            .collection_id = test::collection_id,
+            .projection = std::vector<std::string>{"key"},
+        });
+        ASSERT_TRUE(cursor) << cursor.error().message;
+        const auto batch = (*cursor)->Next();
+        ASSERT_FALSE(batch);
+        EXPECT_EQ(batch.error().code, "CORRUPTION") << batch.error().message;
+        EXPECT_EQ(cache->Stats().FooterEntries, 0U);
+        EXPECT_FALSE(Engine_->GetHealth().read_available);
+
+        const auto reconciled = Engine_->Reconcile();
+        ASSERT_FALSE(reconciled);
+        EXPECT_EQ(reconciled.error().code, "CORRUPTION") << reconciled.error().message;
+        EXPECT_FALSE(Engine_->GetHealth().read_available);
+
+        WriteBytes(path, original);
+        ASSERT_TRUE(Engine_->Reconcile());
+    }
+
+    // Case 3: Malformed `null_count > rows` in Parquet footer statistics of column 1 ("label")
+    // must NOT close readiness in either `Scan` or `GetFileDetails`; `GetFileDetails` omits `NullCount`.
+    {
+        // Column 1 ("label") has 1 NULL across 3 rows -> in Compact Thrift Statistics,
+        // field 3 `null_count` (`\x36\x02`, zigzag(1) == 2) precedes field 5 `max_value` (`\x28\x05lbl-2`).
+        const size_t nullCountPos = original.find(std::string("\x36\x02\x28\x05") + "lbl-2", labelPath + 8);
+        ASSERT_NE(nullCountPos, std::string::npos);
+
+        std::string damagedStats = original;
+        damagedStats[nullCountPos + 1] = '\x0a'; // zigzag(5) -> null_count = 5 > rows (3)!
+        WriteBytes(path, damagedStats);
+
+        const auto parsed = parquet::ParquetFileReader::OpenFile(path.string())->metadata();
+        const auto stats = parsed->RowGroup(0)->ColumnChunk(1)->encoded_statistics();
+        ASSERT_NE(stats, nullptr);
+        ASSERT_TRUE(stats->has_null_count);
+        EXPECT_EQ(stats->null_count, 5);
+
+        cache->Clear();
+        const auto cursor = Engine_->Scan({
+            .collection_id = test::collection_id,
+            .projection = std::vector<std::string>{"key"},
+            .predicate = Predicate::IsNull("label"),
+        });
+        ASSERT_TRUE(cursor) << cursor.error().message;
+        EXPECT_EQ(DrainRendered(**cursor), std::vector<std::string>{"k1"});
+        EXPECT_TRUE(Engine_->GetHealth().read_available);
+
+        const auto statsDetails = Engine_->GetFileDetails(test::collection_id, fileId);
+        ASSERT_TRUE(statsDetails) << statsDetails.error().message;
+        ASSERT_EQ(statsDetails->RowGroups.size(), 1U);
+        EXPECT_FALSE(statsDetails->RowGroups[0].Columns[1].NullCount.has_value());
+        EXPECT_TRUE(Engine_->GetHealth().read_available);
+
+        // Also check contradictory `null_count == rows` (3) combined with non-empty min/max bounds:
+        // `GetFileDetails` must omit `NullCount`, `LowerBound`, and `UpperBound` without closing readiness.
+        damagedStats[nullCountPos + 1] = '\x06'; // zigzag(3) -> null_count = 3 == rows alongside min/max!
+        WriteBytes(path, damagedStats);
+        cache->Clear();
+        const auto allNullBoundsDetails = Engine_->GetFileDetails(test::collection_id, fileId);
+        ASSERT_TRUE(allNullBoundsDetails) << allNullBoundsDetails.error().message;
+        ASSERT_EQ(allNullBoundsDetails->RowGroups.size(), 1U);
+        EXPECT_FALSE(allNullBoundsDetails->RowGroups[0].Columns[1].NullCount.has_value());
+        EXPECT_FALSE(allNullBoundsDetails->RowGroups[0].Columns[1].LowerBound.has_value());
+        EXPECT_FALSE(allNullBoundsDetails->RowGroups[0].Columns[1].UpperBound.has_value());
+        EXPECT_TRUE(Engine_->GetHealth().read_available);
+        EXPECT_TRUE(Engine_->Reconcile());
+    }
+}
+
+#if defined(GLAMDB_ENABLE_CACHE_TEST_HOOKS)
+TEST_F(ScanPruningVerticalTest, CacheAllocFailuresDuringColdReadsRemainBestEffort)
+{
+    CreateEngine();
+    const auto cache = StorageBackend_->ReadMetadataCache();
+    ASSERT_NE(cache, nullptr);
+
+    ASSERT_EQ(Engine_
+                  ->AppendDurable({test::collection_id,
+                      FirstOperation,
+                      {},
+                      {MakePruningBatch({
+                          {"k0", "lbl-0", 10, 1.0, true, 100, "p0"},
+                          {"k1", "lbl-1", 20, 2.0, false, 200, "p1"},
+                      })}})
+                  .disposition,
+        CommitDisposition::Committed);
+
+    cache->Clear();
+    ASSERT_EQ(cache->Stats().UsedBytes, 0U);
+
+    size_t attemptedAllocs = 0;
+    {
+        detail::TScopedCacheAllocInjector failAllCacheAllocs(/*failOnCall=*/1, /*failAll=*/true);
+
+        const auto stats = Engine_->GetStatistics(test::collection_id);
+        ASSERT_TRUE(stats) << stats.error().message;
+        EXPECT_EQ(stats->rows.value, 2);
+
+        const auto files = Engine_->ListFiles(test::collection_id);
+        ASSERT_TRUE(files) << files.error().message;
+        EXPECT_EQ(files->Files.size(), 1U);
+
+        const auto explain = Engine_->ExplainScan({.collection_id = test::collection_id});
+        ASSERT_TRUE(explain) << explain.error().message;
+        EXPECT_EQ(explain->candidates.rows.value, 2);
+
+        const auto cursor = Engine_->Scan({
+            .collection_id = test::collection_id,
+            .projection = std::vector<std::string>{"key"},
+        });
+        ASSERT_TRUE(cursor) << cursor.error().message;
+        EXPECT_EQ(DrainRendered(**cursor), (std::vector<std::string>{"k0", "k1"}));
+
+        attemptedAllocs = detail::TScopedCacheAllocInjector::AllocationCount();
+    }
+
+    EXPECT_GT(attemptedAllocs, 0U);
+    const auto cacheStats = cache->Stats();
+    EXPECT_EQ(cacheStats.UsedBytes, 0U);
+    EXPECT_EQ(cacheStats.RootEntries, 0U);
+    EXPECT_EQ(cacheStats.ManifestListEntries, 0U);
+    EXPECT_EQ(cacheStats.ManifestEntries, 0U);
+    EXPECT_EQ(cacheStats.FooterEntries, 0U);
+}
+#endif
+
+TEST_F(ScanPruningVerticalTest, ExplainScanFitsSingleMetadataEnvelopeUnder1200MiBBudget)
+{
+    ResourceLimits limits;
+    limits.memory_bytes[static_cast<size_t>(ResourceClass::Metadata)] = 1200ULL << 20;
+    auto owner = std::make_shared<ResourceOwner>(limits);
+
+    detail::TLocalStorageOptions storageOpts;
+    storageOpts.Resources = owner;
+    auto created = detail::EngineFactory::CreateWith(
+        {.store_id = test::store_id, .absolute_root = Root_.string(), .resources = owner},
+        MakeFactory(storageOpts));
+    ASSERT_TRUE(created) << created.error().message;
+    Engine_ = *created;
+
+    ASSERT_EQ(Engine_->CreateCollection({test::collection_id, "pruning_events", PruningSchema}).disposition,
+        CommitDisposition::Committed);
+    ASSERT_EQ(Engine_
+                  ->AppendDurable({test::collection_id,
+                      FirstOperation,
+                      {},
+                      {MakePruningBatch({
+                          {"k0", "lbl-0", 10, 1.0, true, 100, "p0"},
+                          {"k1", "lbl-1", 20, 2.0, false, 200, "p1"},
+                      })}})
+                  .disposition,
+        CommitDisposition::Committed);
+
+    const ScanRequest request{
+        .collection_id = test::collection_id,
+        .projection = std::vector<std::string>{"key"},
+        .predicate = Predicate::In("label", {std::string("lbl-0"), std::string("lbl-1")}),
+    };
+
+    const auto cursor = Engine_->Scan(request);
+    ASSERT_TRUE(cursor) << cursor.error().message;
+    EXPECT_EQ(DrainRendered(**cursor), (std::vector<std::string>{"k0", "k1"}));
+
+    const auto explain = Engine_->ExplainScan(request);
+    ASSERT_TRUE(explain) << explain.error().message;
+    EXPECT_EQ(explain->candidates.rows.value, 2);
+}
+
+TEST_F(ScanPruningVerticalTest, MultiRowGroupOverlappingChunksAndContradictoryAllNullBounds)
+{
+    const auto makeIncompressible = [](size_t len, uint64_t seed) {
+        std::string out;
+        out.reserve(len);
+        uint64_t state = seed;
+        for (size_t i = 0; i < len; ++i) {
+            state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+            out.push_back(static_cast<char>('!' + ((state >> 56U) % 90U)));
+        }
+        return out;
+    };
+    const auto encodeZigZag = [](int64_t val) {
+        uint64_t zz = (static_cast<uint64_t>(val) << 1U) ^ static_cast<uint64_t>(-(val < 0));
+        std::string out;
+        while (zz >= 0x80U) {
+            out.push_back(static_cast<char>((zz & 0x7fU) | 0x80U));
+            zz >>= 7U;
+        }
+        out.push_back(static_cast<char>(zz));
+        return out;
+    };
+    const auto encodeFixedWidthZigZag = [&](int64_t val, size_t width) {
+        std::string out = encodeZigZag(val);
+        EXPECT_LE(out.size(), width);
+        while (out.size() < width) {
+            out.back() = static_cast<char>(static_cast<uint8_t>(out.back()) | 0x80U);
+            out.push_back('\x00');
+        }
+        return out;
+    };
+
+    detail::TLocalStorageOptions options;
+    options.Writer.MaxRowGroupBytes = 13000;
+    CreateEngine(options);
+    const auto cache = StorageBackend_->ReadMetadataCache();
+    ASSERT_NE(cache, nullptr);
+
+    ASSERT_EQ(Engine_
+                  ->AppendDurable({test::collection_id,
+                      FirstOperation,
+                      {},
+                      {MakePruningBatch({
+                          {"k0", std::nullopt, 10, 1.0, true, 100, makeIncompressible(12000, 1)},
+                          {"k1", std::nullopt, 20, 2.0, false, 200, makeIncompressible(12000, 2)},
+                      })}})
+                  .disposition,
+        CommitDisposition::Committed);
+
+    const auto listing = Engine_->ListFiles(test::collection_id);
+    ASSERT_TRUE(listing) << listing.error().message;
+    ASSERT_EQ(listing->Files.size(), 1U);
+    const auto fileId = listing->Files.front().FileID;
+    const auto details = Engine_->GetFileDetails(test::collection_id, fileId);
+    ASSERT_TRUE(details) << details.error().message;
+    ASSERT_EQ(details->RowGroups.size(), 2U);
+
+    const auto dataPath = FilesIn(Root_ / "warehouse" / test::collection_id / "data").front();
+    const std::string originalData = ReadBytes(dataPath);
+    const int64_t fileSize = static_cast<int64_t>(originalData.size());
+    const int64_t dataEnd = fileSize - details->FooterBytes - 8;
+    ASSERT_GT(2 * (dataEnd - 8), fileSize);
+
+    const auto readIo = StorageBackend_->ReadOnlyFileIO();
+    ASSERT_TRUE(readIo);
+    const auto rootMeta = NGlamDB::NStorage::ReadTableMetadata(**readIo, listing->Identity.metadata_location);
+    ASSERT_TRUE(rootMeta);
+    const auto snapshotRes = (*rootMeta)->Snapshot();
+    ASSERT_TRUE(snapshotRes);
+    const auto& snapshot = *snapshotRes;
+    const iceberg::SnapshotReader snapReader(snapshot.get());
+    const auto manifestsRes = snapReader.Manifests(*readIo);
+    ASSERT_TRUE(manifestsRes);
+    ASSERT_EQ(manifestsRes->size(), 1U);
+    const iceberg::ManifestFile origManifestFile = manifestsRes->front();
+
+    const auto manifestDiskPath = Root_ / "warehouse" / test::collection_id / "metadata" /
+        std::filesystem::path(origManifestFile.manifest_path).filename();
+    const auto manifestListDiskPath = Root_ / "warehouse" / test::collection_id / "metadata" /
+        std::filesystem::path(snapshot->manifest_list).filename();
+    const std::string originalManifest = ReadBytes(manifestDiskPath);
+    const std::string originalManifestList = ReadBytes(manifestListDiskPath);
+
+    const auto schema = (*rootMeta)->Schema().value();
+    const auto spec = (*rootMeta)->PartitionSpec().value();
+    const auto mReader = iceberg::ManifestReader::Make(origManifestFile, *readIo, schema, spec);
+    ASSERT_TRUE(mReader);
+    const auto liveEntries = (*mReader)->LiveEntries();
+    ASSERT_TRUE(liveEntries);
+    ASSERT_EQ(liveEntries->size(), 1U);
+    const iceberg::DataFile origDataFile = *liveEntries->front().data_file;
+
+    const auto rewriteManifest = [&](const iceberg::DataFile& updatedFile) {
+        std::shared_ptr<iceberg::FileIO> memIo = iceberg::arrow::MakeMockFileIO();
+        auto mWriter =
+            iceberg::ManifestWriter::MakeWriter(2, snapshot->snapshot_id, "mem://m.avro", memIo, spec, schema);
+        ASSERT_TRUE(mWriter) << mWriter.error().message;
+        ASSERT_TRUE((*mWriter)->WriteAddedEntry(std::make_shared<iceberg::DataFile>(updatedFile)));
+        ASSERT_TRUE((*mWriter)->Close());
+        const auto mBytes = memIo->ReadFile("mem://m.avro", std::nullopt);
+        ASSERT_TRUE(mBytes);
+
+        iceberg::ManifestFile newManifestFile = origManifestFile;
+        newManifestFile.manifest_length = static_cast<int64_t>(mBytes->size());
+        auto mlWriter = iceberg::ManifestListWriter::MakeWriter(2,
+            snapshot->snapshot_id,
+            snapshot->parent_snapshot_id,
+            "mem://ml.avro",
+            memIo,
+            snapshot->sequence_number);
+        ASSERT_TRUE(mlWriter) << mlWriter.error().message;
+        ASSERT_TRUE((*mlWriter)->Add(newManifestFile));
+        ASSERT_TRUE((*mlWriter)->Close());
+        const auto mlBytes = memIo->ReadFile("mem://ml.avro", std::nullopt);
+        ASSERT_TRUE(mlBytes);
+
+        WriteBytes(manifestDiskPath, *mBytes);
+        WriteBytes(manifestListDiskPath, *mlBytes);
+    };
+
+    // Sanity check: rewriting identical DataFile passes Reconcile cleanly.
+    rewriteManifest(origDataFile);
+    ASSERT_TRUE(Engine_->Reconcile());
+
+    const size_t footerStart = static_cast<size_t>(dataEnd);
+    const auto origParquet = parquet::ParquetFileReader::OpenFile(dataPath.string())->metadata();
+
+    // Locate ColumnMetaData for column 6 ("payload", field_id == 7) in RG 0 and RG 1.
+    const size_t payload0Pos = originalData.find(std::string("\x19\x18\x07") + "payload", footerStart);
+    ASSERT_NE(payload0Pos, std::string::npos);
+    const size_t payload1Pos = originalData.find(std::string("\x19\x18\x07") + "payload", payload0Pos + 10);
+    ASSERT_NE(payload1Pos, std::string::npos);
+
+    const auto patchPayloadChunk = [&](std::string& buf, size_t pathPos, int rgIdx, int64_t newComp, int64_t newOff) {
+        const auto chunk = origParquet->RowGroup(rgIdx)->ColumnChunk(6);
+        const std::string origCompEnc = encodeZigZag(chunk->total_compressed_size());
+        // Field 7 (total_compressed_size after field 6 total_uncompressed_size) has delta 1 (`\x16`).
+        const size_t compField = buf.find(std::string(1, '\x16') + origCompEnc, pathPos + 10);
+        ASSERT_NE(compField, std::string::npos);
+        const std::string newCompEnc = encodeFixedWidthZigZag(newComp, origCompEnc.size());
+        buf.replace(compField + 1, origCompEnc.size(), newCompEnc);
+
+        const std::string origDataOffEnc = encodeZigZag(chunk->data_page_offset());
+        // Field 9 (data_page_offset after field 7) has delta 2 (`\x26`).
+        const size_t dataOffField =
+            buf.find(std::string(1, '\x26') + origDataOffEnc, compField + 1 + newCompEnc.size());
+        ASSERT_NE(dataOffField, std::string::npos);
+        const std::string newDataOffEnc = encodeFixedWidthZigZag(newOff, origDataOffEnc.size());
+        buf.replace(dataOffField + 1, origDataOffEnc.size(), newDataOffEnc);
+
+        if (chunk->has_dictionary_page()) {
+            const std::string origDictOffEnc = encodeZigZag(chunk->dictionary_page_offset());
+            const size_t dictOffField =
+                buf.find(std::string(1, '\x26') + origDictOffEnc, dataOffField + 1 + newDataOffEnc.size());
+            ASSERT_NE(dictOffField, std::string::npos);
+            const std::string newDictOffEnc = encodeFixedWidthZigZag(newOff, origDictOffEnc.size());
+            buf.replace(dictOffField + 1, origDictOffEnc.size(), newDictOffEnc);
+        }
+    };
+
+    // Case 1: 2-row-group overlapping chunks whose per-chunk ranges fit in [4, dataEnd),
+    // while summed compressed bytes exceed file_size_in_bytes and match manifest column_sizes[7].
+    // Both ListFiles/GetFileDetails/Scan AND Engine::Reconcile() must reject with CORRUPTION (no livelock).
+    {
+        const int64_t inflatedChunk = dataEnd - 8;
+        std::string damagedData = originalData;
+        patchPayloadChunk(damagedData, payload0Pos, 0, inflatedChunk, 4);
+        patchPayloadChunk(damagedData, payload1Pos, 1, inflatedChunk, 4);
+        ASSERT_EQ(static_cast<int64_t>(damagedData.size()), fileSize);
+        WriteBytes(dataPath, damagedData);
+
+        iceberg::DataFile inflatedFile = origDataFile;
+        inflatedFile.column_sizes[7] = 2 * inflatedChunk;
+        ASSERT_GT(inflatedFile.column_sizes[7], fileSize);
+        rewriteManifest(inflatedFile);
+
+        // Force ReadView through cold manifest read by invalidating via Reconcile or cold ListFiles:
+        // First trigger Reconcile directly, and also verify ListFiles -> Reconcile stays in RecoveryRequired!
+        ASSERT_TRUE(Engine_->Shutdown(1000ms));
+        Engine_.reset();
+        StorageBackend_.reset();
+        auto reopened = detail::EngineFactory::OpenWith({Root_.string(), test::store_id}, MakeFactory(options));
+        ASSERT_FALSE(reopened);
+        EXPECT_EQ(reopened.error().code, "CORRUPTION") << reopened.error().message;
+
+        // Restore valid state, reopen Ready, then corrupt on disk + clear cache and check ListFiles -> Reconcile!
+        WriteBytes(dataPath, originalData);
+        WriteBytes(manifestDiskPath, originalManifest);
+        WriteBytes(manifestListDiskPath, originalManifestList);
+        reopened = detail::EngineFactory::OpenWith({Root_.string(), test::store_id}, MakeFactory(options));
+        ASSERT_TRUE(reopened) << reopened.error().message;
+        Engine_ = *reopened;
+        const auto reopenedCache = StorageBackend_->ReadMetadataCache();
+        ASSERT_NE(reopenedCache, nullptr);
+
+        WriteBytes(dataPath, damagedData);
+        rewriteManifest(inflatedFile);
+        reopenedCache->Clear();
+
+        // Scan/GetFileDetails reads Parquet footer and latches RecoveryRequired; Reconcile must ALSO reject!
+        const auto badDetails = Engine_->GetFileDetails(test::collection_id, fileId);
+        ASSERT_FALSE(badDetails);
+        EXPECT_EQ(badDetails.error().code, "CORRUPTION") << badDetails.error().message;
+        EXPECT_FALSE(Engine_->GetHealth().read_available);
+
+        const auto reconciled = Engine_->Reconcile();
+        ASSERT_FALSE(reconciled);
+        EXPECT_EQ(reconciled.error().code, "CORRUPTION") << reconciled.error().message;
+        EXPECT_FALSE(Engine_->GetHealth().read_available);
+
+        WriteBytes(dataPath, originalData);
+        WriteBytes(manifestDiskPath, originalManifest);
+        WriteBytes(manifestListDiskPath, originalManifestList);
+        ASSERT_TRUE(Engine_->Reconcile());
+        EXPECT_TRUE(Engine_->GetHealth().read_available);
+    }
+
+    // Case 2: Overlapping column chunks across 2 row groups WITHOUT exceeding file_size_in_bytes
+    // (keep original compressed sizes, only point RG 1 col 6 offset at RG 0 col 6 offset):
+    // Scan, GetFileDetails, and Reconcile all reject with CORRUPTION.
+    {
+        const auto rg0Chunk6 = origParquet->RowGroup(0)->ColumnChunk(6);
+        const int64_t rg0Start =
+            rg0Chunk6->has_dictionary_page() ? rg0Chunk6->dictionary_page_offset() : rg0Chunk6->data_page_offset();
+        const int64_t rg1Comp = origParquet->RowGroup(1)->ColumnChunk(6)->total_compressed_size();
+        std::string overlapData = originalData;
+        patchPayloadChunk(overlapData, payload1Pos, 1, rg1Comp, rg0Start);
+        WriteBytes(dataPath, overlapData);
+
+        StorageBackend_->ReadMetadataCache()->Clear();
+        const auto cursor = Engine_->Scan({
+            .collection_id = test::collection_id,
+            .projection = std::vector<std::string>{"key"},
+        });
+        ASSERT_TRUE(cursor) << cursor.error().message;
+        const auto batch = (*cursor)->Next();
+        ASSERT_FALSE(batch);
+        EXPECT_EQ(batch.error().code, "CORRUPTION") << batch.error().message;
+        EXPECT_FALSE(Engine_->GetHealth().read_available);
+
+        const auto reconciled = Engine_->Reconcile();
+        ASSERT_FALSE(reconciled);
+        EXPECT_EQ(reconciled.error().code, "CORRUPTION") << reconciled.error().message;
+
+        WriteBytes(dataPath, originalData);
+        ASSERT_TRUE(Engine_->Reconcile());
+    }
+
+    // Case 3: Contradictory bounds on an all-null column ("label", field_id == 2, NullCount == 2 == record_count)
+    // in the manifest must NOT close readiness; ListFiles omits both NullCount and LowerBound/UpperBound.
+    {
+        iceberg::DataFile contradictoryStats = origDataFile;
+        contradictoryStats.null_value_counts[2] = contradictoryStats.record_count;
+        contradictoryStats.lower_bounds[2] = {'a'};
+        contradictoryStats.upper_bounds[2] = {'z'};
+        rewriteManifest(contradictoryStats);
+        ASSERT_TRUE(Engine_->Reconcile());
+
+        const auto files = Engine_->ListFiles(test::collection_id);
+        ASSERT_TRUE(files) << files.error().message;
+        ASSERT_EQ(files->Files.size(), 1U);
+        const auto& labelMetrics = files->Files.front().FieldMetrics[1];
+        EXPECT_EQ(labelMetrics.FieldID, 2);
+        EXPECT_FALSE(labelMetrics.NullCount.has_value());
+        EXPECT_FALSE(labelMetrics.LowerBound.has_value());
+        EXPECT_FALSE(labelMetrics.UpperBound.has_value());
+        EXPECT_TRUE(Engine_->GetHealth().read_available);
+
+        WriteBytes(manifestDiskPath, originalManifest);
+        WriteBytes(manifestListDiskPath, originalManifestList);
+        ASSERT_TRUE(Engine_->Reconcile());
     }
 }
 

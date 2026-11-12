@@ -623,6 +623,7 @@ struct Engine::Impl
             auto memory = Take(resources->Reserve(ResourceClass::Metadata, MetadataWorkBytes));
             const auto capabilities = backend->GetCapabilities();
             context.Resources = resources;
+            context.PlanningMemory = memory;
             context.FileIO = Take(backend->ReadOnlyFileIO());
             context.Cache = useCache ? backend->ReadMetadataCache() : nullptr;
             context.EnableFilePruning = capabilities.file_pruning;

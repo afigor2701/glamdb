@@ -18,6 +18,10 @@ namespace NGlamDB::NStorage {
 struct TBaseState;
 }
 
+namespace glamdb {
+class ResourceReservation;
+} // namespace glamdb
+
 namespace glamdb::detail {
 
 class TSnapshotMetadataCache;
@@ -25,6 +29,9 @@ class TSnapshotMetadataCache;
 struct TScanContext
 {
     std::shared_ptr<ResourceOwner> Resources{};
+    // Optional caller-held MetadataWorkBytes envelope (e.g. from Engine::ReadView
+    // during ExplainScan) so OpenScan does not double-reserve 768 MiB.
+    std::shared_ptr<ResourceReservation> PlanningMemory{};
     CollectionInfo Collection;
     // The committed view resolved once by the engine.
     BaseIdentity Base;

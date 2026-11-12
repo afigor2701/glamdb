@@ -183,7 +183,22 @@ iceberg::Status CheckNativeBounds(const parquet::ColumnChunkMetaData& chunk,
     return {};
 }
 
+bool AddCheckedBytes(std::int64_t& total, std::int64_t bytes)
+{
+    if (bytes < 0 || total > std::numeric_limits<std::int64_t>::max() - bytes) {
+        return false;
+    }
+    total += bytes;
+    return true;
+}
+
+bool IsValidDataRange(std::int64_t offset, std::int64_t length, std::int64_t dataEnd)
+{
+    return offset >= 4 && offset < dataEnd && length >= 0 && length <= dataEnd - offset;
+}
+
 iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ParseFooter(std::span<const std::byte> bytes,
+    std::int64_t dataEnd,
     std::int64_t expectedRows,
     const iceberg::Schema& schema,
     const TParquetLimits& limits)
@@ -215,12 +230,19 @@ iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ParseFooter(std::span<co
             }
         }
         std::int64_t rowCount = 0;
+        std::int64_t fileCompressed = 0;
+        std::vector<std::pair<std::int64_t, std::int64_t>> dataSpans;
         for (int index = 0; index < metadata->num_row_groups(); ++index) {
             const auto group = metadata->RowGroup(index);
             const auto rows = group->num_rows();
             if (rows < 0 || rows > expectedRows - rowCount || group->num_columns() != metadata->num_columns()) {
                 return iceberg::Invalid("CORRUPTION: Invalid Parquet row group count.");
             }
+            const auto groupUncompressed = group->total_byte_size();
+            if (groupUncompressed < 0) {
+                return iceberg::Invalid("CORRUPTION: Negative Parquet row group byte size.");
+            }
+            std::int64_t sumUncompressed = 0;
             for (int column = 0; column < group->num_columns(); ++column) {
                 const auto chunk = group->ColumnChunk(column);
                 const auto* descriptor = metadata->schema()->Column(column);
@@ -231,8 +253,59 @@ iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ParseFooter(std::span<co
                 }
                 ICEBERG_RETURN_UNEXPECTED(
                     CheckNativeBounds(*chunk, *descriptor, *fields[static_cast<std::size_t>(column)].type()));
+                (void)chunk->compression();
+                (void)chunk->encodings();
+                for (const auto& encodingStats : chunk->encoding_stats()) {
+                    if (encodingStats.count < 0) {
+                        return iceberg::Invalid("CORRUPTION: Parquet page encoding count is negative.");
+                    }
+                }
+                if (!chunk->file_path().empty() || chunk->num_values() != rows) {
+                    return iceberg::Invalid("CORRUPTION: Parquet column metadata does not match the row group.");
+                }
+                const auto compressedBytes = chunk->total_compressed_size();
+                const auto uncompressedBytes = chunk->total_uncompressed_size();
+                if (!AddCheckedBytes(fileCompressed, compressedBytes) ||
+                    !AddCheckedBytes(sumUncompressed, uncompressedBytes))
+                {
+                    return iceberg::Invalid("CORRUPTION: Parquet byte counts are negative or overflow.");
+                }
+                const auto dataPageOffset = chunk->data_page_offset();
+                const auto chunkStartOffset =
+                    chunk->has_dictionary_page() ? chunk->dictionary_page_offset() : dataPageOffset;
+                if (!IsValidDataRange(dataPageOffset, 0, dataEnd) ||
+                    !IsValidDataRange(chunkStartOffset, compressedBytes, dataEnd))
+                {
+                    return iceberg::Invalid("CORRUPTION: Parquet column range is outside the file data.");
+                }
+                if (compressedBytes > 0) {
+                    dataSpans.emplace_back(chunkStartOffset, chunkStartOffset + compressedBytes);
+                }
+                for (const auto& indexLocation : {chunk->GetColumnIndexLocation(), chunk->GetOffsetIndexLocation()}) {
+                    if (indexLocation) {
+                        if (!IsValidDataRange(indexLocation->offset, indexLocation->length, dataEnd)) {
+                            return iceberg::Invalid("CORRUPTION: Parquet column index range is outside the file data.");
+                        }
+                        if (indexLocation->length > 0) {
+                            dataSpans.emplace_back(indexLocation->offset,
+                                indexLocation->offset + indexLocation->length);
+                        }
+                    }
+                }
+            }
+            if (sumUncompressed != groupUncompressed) {
+                return iceberg::Invalid("CORRUPTION: Parquet row group byte counts differ from its columns.");
             }
             rowCount += rows;
+        }
+        if (fileCompressed > dataEnd - 4) {
+            return iceberg::Invalid("CORRUPTION: Parquet compressed byte counts exceed the file data.");
+        }
+        std::ranges::sort(dataSpans);
+        for (std::size_t spanIndex = 1; spanIndex < dataSpans.size(); ++spanIndex) {
+            if (dataSpans[spanIndex].first < dataSpans[spanIndex - 1].second) {
+                return iceberg::Invalid("CORRUPTION: Parquet column or index ranges overlap.");
+            }
         }
         if (rowCount != expectedRows) {
             return iceberg::Invalid("CORRUPTION: Parquet row groups do not match the total row count.");
@@ -530,9 +603,10 @@ iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ReadParquetFooterFromStr
         if (footerLength > limits.MaxFooterBytes) {
             return iceberg::InvalidArgument("Parquet footer exceeds its byte limit.");
         }
+        const auto dataEnd = actualSize - 8 - static_cast<std::int64_t>(footerLength);
         std::vector<std::byte> footer(footerLength);
-        ICEBERG_RETURN_UNEXPECTED(stream.ReadFully(actualSize - 8 - footerLength, footer));
-        auto parsed = ParseFooter(footer, expectedRows, schema, limits);
+        ICEBERG_RETURN_UNEXPECTED(stream.ReadFully(dataEnd, footer));
+        auto parsed = ParseFooter(footer, dataEnd, expectedRows, schema, limits);
         if (parsed && bytesReadOut != nullptr) {
             *bytesReadOut += header.size() + trailer.size() + footer.size();
         }

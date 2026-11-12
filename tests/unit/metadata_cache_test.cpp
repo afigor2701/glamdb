@@ -246,6 +246,7 @@ TEST(SnapshotMetadataCacheUnitTest, DisabledZeroByteCacheEvictRootClearAndThread
     EXPECT_EQ(owner->GetUsage().memory_bytes[1], 0U);
 }
 
+#if defined(GLAMDB_ENABLE_CACHE_TEST_HOOKS)
 TEST(SnapshotMetadataCacheUnitTest, StrongExceptionSafetyOnBadAllocAndZeroAllocLookups)
 {
     const auto r1 = MakeDummyRoot("store://s/warehouse/c/metadata/00001-a.metadata.json");
@@ -393,6 +394,7 @@ TEST(SnapshotMetadataCacheUnitTest, StrongExceptionSafetyOnBadAllocAndZeroAllocL
         EXPECT_EQ(TScopedCacheAllocInjector::AllocationCount(), 0U);
     }
 }
+#endif
 
 } // namespace
 } // namespace glamdb::detail

@@ -37,6 +37,16 @@ option(GLAMDB_BUILD_LOGGING "Build Quill logging in IO-only mode" OFF)
 include(cmake/CompilerOptions.cmake)
 include(cmake/Sanitizers.cmake)
 include(cmake/Quality.cmake)
+if(DEFINED GLAMDB_ENABLE_CACHE_TEST_HOOKS)
+    option(GLAMDB_ENABLE_CACHE_TEST_HOOKS
+        "Enable TSnapshotMetadataCache allocator fault-injection hooks" OFF)
+    if(GLAMDB_ENABLE_CACHE_TEST_HOOKS)
+        target_compile_definitions(glamdb_build_options INTERFACE GLAMDB_ENABLE_CACHE_TEST_HOOKS=1)
+    endif()
+elseif(BUILD_TESTING)
+    target_compile_definitions(glamdb_build_options INTERFACE
+        "$<$<NOT:$<CONFIG:Release>>:GLAMDB_ENABLE_CACHE_TEST_HOOKS=1>")
+endif()
 
 add_subdirectory(core)
 if(NOT GLAMDB_IO_ONLY)

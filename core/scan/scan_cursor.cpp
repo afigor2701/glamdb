@@ -652,7 +652,7 @@ private:
         if (!verifiedFooter) {
             verifiedFooter = Take(source->ReadFooter(*FileSchema_, {file.SizeBytes, file.RecordCount}));
             if (Context_.Cache) {
-                Context_.Cache->PutFooter(file.Path, file.SizeBytes, file.RecordCount, verifiedFooter);
+                Context_.Cache->TryPutFooter(file.Path, file.SizeBytes, file.RecordCount, verifiedFooter);
             }
         }
         ++DataFilesRead_;
@@ -809,7 +809,9 @@ Result<std::shared_ptr<ScanCursor>> OpenScan(TScanContext context, const ScanReq
     try {
         context.Resources = context.Resources ? context.Resources : ResourceOwner::ProcessDefault();
         auto controlMemory = Take(context.Resources->Reserve(ResourceClass::Control, ControlMemoryBytes));
-        auto planningMemory = Take(context.Resources->Reserve(ResourceClass::Metadata, MetadataWorkBytes));
+        auto planningMemory = context.PlanningMemory
+            ? std::move(context.PlanningMemory)
+            : Take(context.Resources->Reserve(ResourceClass::Metadata, MetadataWorkBytes));
         RequireInput(request.batch_rows >= 1 && request.batch_rows <= MaxBatchRows,
             "batch_rows must be within 1..65536");
         RequireInput(!request.limit || *request.limit >= 0, "limit must not be negative");

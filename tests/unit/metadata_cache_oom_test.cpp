@@ -18,17 +18,20 @@
 #include <parquet/file_reader.h>
 #include <parquet/metadata.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <new>
 #include <string>
 #include <vector>
 
+#if !defined(GLAMDB_HAS_INTERCEPTING_SANITIZER)
 #if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
 #define GLAMDB_HAS_INTERCEPTING_SANITIZER 1
 #elif defined(__has_feature)
 #if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer) || __has_feature(memory_sanitizer) ||          \
     __has_feature(leak_sanitizer)
 #define GLAMDB_HAS_INTERCEPTING_SANITIZER 1
+#endif
 #endif
 #endif
 
@@ -70,20 +73,97 @@ public:
     }
 };
 
-} // namespace
-
-void* operator new(std::size_t size)
+bool ShouldFailGlobalNew() noexcept
 {
-    if (TlsNewFault.Active) {
-        ++TlsNewFault.Calls;
-        if (TlsNewFault.FailAll || (TlsNewFault.FailOnCall > 0 && TlsNewFault.Calls == TlsNewFault.FailOnCall)) {
+    if (!TlsNewFault.Active) {
+        return false;
+    }
+    ++TlsNewFault.Calls;
+    return TlsNewFault.FailAll || (TlsNewFault.FailOnCall > 0 && TlsNewFault.Calls == TlsNewFault.FailOnCall);
+}
+
+void* AllocateUnaligned(std::size_t size, bool canThrow)
+{
+    if (ShouldFailGlobalNew()) {
+        if (canThrow) {
             throw std::bad_alloc{};
         }
+        return nullptr;
     }
     if (void* ptr = std::malloc(size == 0 ? 1 : size)) {
         return ptr;
     }
-    throw std::bad_alloc{};
+    if (canThrow) {
+        throw std::bad_alloc{};
+    }
+    return nullptr;
+}
+
+void* AllocateAligned(std::size_t size, std::align_val_t alignment, bool canThrow)
+{
+    if (ShouldFailGlobalNew()) {
+        if (canThrow) {
+            throw std::bad_alloc{};
+        }
+        return nullptr;
+    }
+    const std::size_t effectiveAlign = std::max(static_cast<std::size_t>(alignment), sizeof(void*));
+    if ((effectiveAlign & (effectiveAlign - 1)) != 0) {
+        if (canThrow) {
+            throw std::bad_alloc{};
+        }
+        return nullptr;
+    }
+    void* ptr = nullptr;
+    if (posix_memalign(&ptr, effectiveAlign, size == 0 ? 1 : size) == 0) {
+        return ptr;
+    }
+    if (canThrow) {
+        throw std::bad_alloc{};
+    }
+    return nullptr;
+}
+
+} // namespace
+
+void* operator new(std::size_t size)
+{
+    return AllocateUnaligned(size, true);
+}
+
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept
+{
+    return AllocateUnaligned(size, false);
+}
+
+void* operator new[](std::size_t size)
+{
+    return AllocateUnaligned(size, true);
+}
+
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept
+{
+    return AllocateUnaligned(size, false);
+}
+
+void* operator new(std::size_t size, std::align_val_t alignment)
+{
+    return AllocateAligned(size, alignment, true);
+}
+
+void* operator new(std::size_t size, std::align_val_t alignment, const std::nothrow_t&) noexcept
+{
+    return AllocateAligned(size, alignment, false);
+}
+
+void* operator new[](std::size_t size, std::align_val_t alignment)
+{
+    return AllocateAligned(size, alignment, true);
+}
+
+void* operator new[](std::size_t size, std::align_val_t alignment, const std::nothrow_t&) noexcept
+{
+    return AllocateAligned(size, alignment, false);
 }
 
 void operator delete(void* ptr) noexcept
@@ -92,6 +172,56 @@ void operator delete(void* ptr) noexcept
 }
 
 void operator delete(void* ptr, std::size_t) noexcept
+{
+    std::free(ptr);
+}
+
+void operator delete(void* ptr, const std::nothrow_t&) noexcept
+{
+    std::free(ptr);
+}
+
+void operator delete[](void* ptr) noexcept
+{
+    std::free(ptr);
+}
+
+void operator delete[](void* ptr, std::size_t) noexcept
+{
+    std::free(ptr);
+}
+
+void operator delete[](void* ptr, const std::nothrow_t&) noexcept
+{
+    std::free(ptr);
+}
+
+void operator delete(void* ptr, std::align_val_t) noexcept
+{
+    std::free(ptr);
+}
+
+void operator delete(void* ptr, std::size_t, std::align_val_t) noexcept
+{
+    std::free(ptr);
+}
+
+void operator delete(void* ptr, std::align_val_t, const std::nothrow_t&) noexcept
+{
+    std::free(ptr);
+}
+
+void operator delete[](void* ptr, std::align_val_t) noexcept
+{
+    std::free(ptr);
+}
+
+void operator delete[](void* ptr, std::size_t, std::align_val_t) noexcept
+{
+    std::free(ptr);
+}
+
+void operator delete[](void* ptr, std::align_val_t, const std::nothrow_t&) noexcept
 {
     std::free(ptr);
 }

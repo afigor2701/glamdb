@@ -15,9 +15,11 @@
 #include <iceberg/schema.h>
 #include <iceberg/snapshot.h>
 #include <iceberg/table_metadata.h>
+#include <parquet/metadata.h>
 
 #include <algorithm>
 #include <limits>
+#include <map>
 #include <set>
 #include <span>
 #include <unordered_set>
@@ -109,6 +111,16 @@ iceberg::Result<std::uint64_t> CheckAvro(iceberg::FileIO& fileIO,
     return static_cast<std::uint64_t>(actual);
 }
 
+template <typename TValue>
+bool HasOnlyKnownFieldIDs(const std::map<std::int32_t, TValue>& values, const iceberg::Schema& schema)
+{
+    return std::ranges::all_of(values, [&](const auto& entry) {
+        return std::ranges::any_of(schema.fields(), [&](const auto& field) {
+            return field.field_id() == entry.first;
+        });
+    });
+}
+
 iceberg::Result<std::uint64_t> CheckData(const std::shared_ptr<iceberg::FileIO>& fileIO,
     const iceberg::DataFile& file,
     const iceberg::Schema& schema,
@@ -120,12 +132,38 @@ iceberg::Result<std::uint64_t> CheckData(const std::shared_ptr<iceberg::FileIO>&
     {
         return iceberg::ValidationFailed("Invalid append data file.");
     }
+    if (!HasOnlyKnownFieldIDs(file.column_sizes, schema) || !HasOnlyKnownFieldIDs(file.value_counts, schema) ||
+        !HasOnlyKnownFieldIDs(file.null_value_counts, schema) || !HasOnlyKnownFieldIDs(file.nan_value_counts, schema) ||
+        !HasOnlyKnownFieldIDs(file.lower_bounds, schema) || !HasOnlyKnownFieldIDs(file.upper_bounds, schema))
+    {
+        return iceberg::ValidationFailed("Manifest metrics contain an unknown field ID.");
+    }
     ICEBERG_RETURN_UNEXPECTED(CheckPath(file.file_path, table, NIO::EFileKind::Data));
     ICEBERG_RETURN_UNEXPECTED(
         CheckReceipt(attempt, file.file_path, NIO::EFileKind::Data, file.file_size_in_bytes, true));
     ICEBERG_ASSIGN_OR_RAISE(auto input, fileIO->NewInputFile(file.file_path, file.file_size_in_bytes));
-    ICEBERG_ASSIGN_OR_RAISE(auto format, CheckParquet(*input, schema, {file.file_size_in_bytes, file.record_count}));
-    return format.FooterBytes;
+    ICEBERG_ASSIGN_OR_RAISE(auto footer,
+        ReadParquetFooter(*input, schema, {file.file_size_in_bytes, file.record_count}));
+    const auto fields = schema.fields();
+    std::vector<std::int64_t> columnCompressed(fields.size(), 0);
+    for (int groupIndex = 0; groupIndex < footer->num_row_groups(); ++groupIndex) {
+        const auto group = footer->RowGroup(groupIndex);
+        for (std::size_t column = 0; column < fields.size(); ++column) {
+            const auto chunkBytes = group->ColumnChunk(static_cast<int>(column))->total_compressed_size();
+            if (chunkBytes < 0 || columnCompressed[column] > file.file_size_in_bytes - chunkBytes) {
+                return iceberg::ValidationFailed("Parquet column sizes exceed the file size.");
+            }
+            columnCompressed[column] += chunkBytes;
+        }
+    }
+    for (std::size_t column = 0; column < fields.size(); ++column) {
+        if (const auto it = file.column_sizes.find(fields[column].field_id());
+            it != file.column_sizes.end() && it->second != columnCompressed[column])
+        {
+            return iceberg::ValidationFailed("Manifest column sizes differ from the Parquet footer.");
+        }
+    }
+    return static_cast<std::uint64_t>(footer->size());
 }
 
 iceberg::Result<TStorageUsage> CheckManifest(const std::shared_ptr<iceberg::FileIO>& fileIO,

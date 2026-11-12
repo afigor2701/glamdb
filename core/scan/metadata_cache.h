@@ -32,6 +32,8 @@ class ResourceReservation;
 
 namespace glamdb::detail {
 
+#if defined(GLAMDB_ENABLE_CACHE_TEST_HOOKS)
+
 void MaybeFailCacheAllocationForTesting();
 
 // Thread-local allocation counter and deterministic std::bad_alloc fault
@@ -78,6 +80,13 @@ struct TCacheAllocator
     }
 };
 
+#else
+
+template <typename T>
+using TCacheAllocator = std::allocator<T>;
+
+#endif
+
 struct TSnapshotMetadataCacheOptions
 {
     uint64_t MaxBytes = ReadCacheMemoryBytes;
@@ -115,21 +124,33 @@ public:
     void PutRoot(std::string_view metadataLocation,
         int64_t fileSize,
         std::shared_ptr<const iceberg::TableMetadata> metadata);
+    void TryPutRoot(std::string_view metadataLocation,
+        int64_t fileSize,
+        std::shared_ptr<const iceberg::TableMetadata> metadata) noexcept;
     void EvictRoot(std::string_view metadataLocation);
 
     std::shared_ptr<const TManifestListValue> FindManifestList(std::string_view manifestListPath);
     void PutManifestList(std::string_view manifestListPath, std::shared_ptr<const TManifestListValue> manifests);
+    void TryPutManifestList(std::string_view manifestListPath,
+        std::shared_ptr<const TManifestListValue> manifests) noexcept;
 
     std::shared_ptr<const TManifestDataFilesValue> FindManifest(std::string_view manifestPath, int64_t manifestLength);
     void PutManifest(std::string_view manifestPath,
         int64_t manifestLength,
         std::shared_ptr<const TManifestDataFilesValue> files);
+    void TryPutManifest(std::string_view manifestPath,
+        int64_t manifestLength,
+        std::shared_ptr<const TManifestDataFilesValue> files) noexcept;
 
     std::shared_ptr<parquet::FileMetaData> FindFooter(std::string_view path, int64_t sizeBytes, int64_t recordCount);
     void PutFooter(std::string_view path,
         int64_t sizeBytes,
         int64_t recordCount,
         std::shared_ptr<parquet::FileMetaData> footer);
+    void TryPutFooter(std::string_view path,
+        int64_t sizeBytes,
+        int64_t recordCount,
+        std::shared_ptr<parquet::FileMetaData> footer) noexcept;
 
     void Clear();
     TSnapshotMetadataCacheStats Stats() const;

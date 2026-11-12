@@ -53,8 +53,11 @@ bounds retain their single-value binary encoding and any configured string
 truncation; they are not decoded or promoted to exact extrema. File length is
 the complete compressed Parquet file, including its footer. Listing reads no
 Parquet data. Details check the actual file length, magic, bounded footer,
-schema/field IDs and total/row-group counts before returning footer metadata.
-Present column sizes and null counts must also agree with manifest metrics.
+schema/field IDs, total/row-group counts, column chunk value/byte counts and
+page/dictionary/index ranges within `[4, dataEnd]` before returning footer
+metadata, using the same structural verifier as recovery and scans. Present
+column sizes must agree with manifest metrics; malformed or contradictory column
+statistics are omitted conservatively without closing readiness.
 Only the header, trailer and footer are read; data pages are not decoded.
 
 Each row group reports its ordinal, rows, summed compressed column bytes,

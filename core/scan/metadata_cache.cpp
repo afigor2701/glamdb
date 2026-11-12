@@ -15,6 +15,7 @@
 namespace glamdb::detail {
 namespace {
 
+#if defined(GLAMDB_ENABLE_CACHE_TEST_HOOKS)
 struct TThreadAllocFaultState
 {
     bool Active = false;
@@ -24,6 +25,7 @@ struct TThreadAllocFaultState
 };
 
 thread_local TThreadAllocFaultState TlsAllocFaultState{};
+#endif
 
 uint64_t AddClamped(uint64_t lhs, uint64_t rhs) noexcept
 {
@@ -119,6 +121,8 @@ uint64_t EstimateFooterBytes(std::string_view path, const parquet::FileMetaData&
 
 } // namespace
 
+#if defined(GLAMDB_ENABLE_CACHE_TEST_HOOKS)
+
 void MaybeFailCacheAllocationForTesting()
 {
     if (!TlsAllocFaultState.Active) {
@@ -151,6 +155,8 @@ size_t TScopedCacheAllocInjector::AllocationCount() noexcept
 {
     return TlsAllocFaultState.Calls;
 }
+
+#endif
 
 TSnapshotMetadataCache::TSnapshotMetadataCache(std::shared_ptr<ResourceReservation> reservation,
     TSnapshotMetadataCacheOptions options)
@@ -301,6 +307,16 @@ void TSnapshotMetadataCache::PutRoot(std::string_view metadataLocation,
         Roots_);
 }
 
+void TSnapshotMetadataCache::TryPutRoot(std::string_view metadataLocation,
+    int64_t fileSize,
+    std::shared_ptr<const iceberg::TableMetadata> metadata) noexcept
+{
+    try {
+        PutRoot(metadataLocation, fileSize, std::move(metadata));
+    } catch (const std::bad_alloc&) {
+    }
+}
+
 void TSnapshotMetadataCache::EvictRoot(std::string_view metadataLocation)
 {
     std::lock_guard lock(Mutex_);
@@ -347,6 +363,15 @@ void TSnapshotMetadataCache::PutManifestList(std::string_view manifestListPath,
         ManifestLists_);
 }
 
+void TSnapshotMetadataCache::TryPutManifestList(std::string_view manifestListPath,
+    std::shared_ptr<const TManifestListValue> manifests) noexcept
+{
+    try {
+        PutManifestList(manifestListPath, std::move(manifests));
+    } catch (const std::bad_alloc&) {
+    }
+}
+
 std::shared_ptr<const TSnapshotMetadataCache::TManifestDataFilesValue>
 TSnapshotMetadataCache::FindManifest(std::string_view manifestPath, int64_t manifestLength)
 {
@@ -380,6 +405,16 @@ void TSnapshotMetadataCache::PutManifest(std::string_view manifestPath,
         Options_.MaxManifests,
         ManifestsLru_,
         Manifests_);
+}
+
+void TSnapshotMetadataCache::TryPutManifest(std::string_view manifestPath,
+    int64_t manifestLength,
+    std::shared_ptr<const TManifestDataFilesValue> files) noexcept
+{
+    try {
+        PutManifest(manifestPath, manifestLength, std::move(files));
+    } catch (const std::bad_alloc&) {
+    }
 }
 
 std::shared_ptr<parquet::FileMetaData>
@@ -416,6 +451,17 @@ void TSnapshotMetadataCache::PutFooter(std::string_view path,
         Options_.MaxFooters,
         FootersLru_,
         Footers_);
+}
+
+void TSnapshotMetadataCache::TryPutFooter(std::string_view path,
+    int64_t sizeBytes,
+    int64_t recordCount,
+    std::shared_ptr<parquet::FileMetaData> footer) noexcept
+{
+    try {
+        PutFooter(path, sizeBytes, recordCount, std::move(footer));
+    } catch (const std::bad_alloc&) {
+    }
 }
 
 void TSnapshotMetadataCache::Clear()

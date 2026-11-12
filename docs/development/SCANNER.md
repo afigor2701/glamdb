@@ -208,16 +208,20 @@ joins a writer attempt or holds a SQLite read transaction.
   and already-failed scans close best-effort),
   eliminating whole-file 32 MiB buffers. On a footer cache miss,
   `ReadParquetFooterFromStream` reads only the magic/tail/footer ranges and
-  verifies the footer with the same rules as recovery: unencrypted metadata,
-  exact field IDs 1..N, names, repetition, physical/logical types, row-group
-  counts and the manifest row count. The verified `parquet::FileMetaData` is
-  handed directly to `parquet::ParquetFileReader::Open` (single-pass footer
-  verification) and inserted into `TSnapshotMetadataCache`.
+  verifies the footer with the same rules as recovery and file-details
+  inspection: unencrypted metadata, exact field IDs 1..N, names, repetition,
+  physical/logical types, row-group and manifest row counts, empty external
+  chunk paths, matching per-chunk value counts, non-negative/non-overflowing
+  compressed and uncompressed byte counts, and page/dictionary/index offsets
+  within `[4, dataEnd]`. The verified `parquet::FileMetaData` is handed directly
+  to `parquet::ParquetFileReader::Open` (single-pass footer verification) and
+  best-effort inserted into `TSnapshotMetadataCache` (ignoring cache-node
+  `std::bad_alloc`).
 - After footer verification, `ExtractRowGroupZoneStats` applies the same
   domain-checked conservative SQL-3VL zone evaluator per row group. If all row
   groups in a file are pruned, no column chunks are read. For surviving row
   groups, `ReadFields_` (`projection ∪ predicate`) are deduplicated and read
-  positionally via `ReadTable(survivingRowGroups, readColumns)` (when
+  positionally via `GetRecordBatchReader(survivingRowGroups, readColumns)` (when
   `ReadFields_` is empty on an unfiltered zero-column scan, empty-column batches
   are synthesized directly from verified row-group row counts without reading
   column pages). Before `SelectRows` evaluates the predicate or any

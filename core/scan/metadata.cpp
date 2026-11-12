@@ -113,11 +113,15 @@ SnapshotHistory ReadHistory(const TScanContext& context, std::span<const AppendR
 
 ScanExplanation ExplainScan(const TScanContext& context, const ScanRequest& request)
 {
-    // OpenScan binds projection/predicate and validates all scan options. It
-    // reads metadata only; Next is never called by explain.
-    const auto cursor = Take(OpenScan(context, request));
     ScanExplanation result;
-    result.info = cursor->Info();
+    {
+        // OpenScan binds projection/predicate and validates all scan options. It
+        // reads metadata only; Next is never called by explain, and destroying
+        // the cursor here releases its temporary control/predicate reservations
+        // before ReadStatistics and result retention run.
+        const auto cursor = Take(OpenScan(context, request));
+        result.info = cursor->Info();
+    }
     result.predicate = request.predicate;
     result.limit = request.limit;
     result.batch_rows = request.batch_rows;

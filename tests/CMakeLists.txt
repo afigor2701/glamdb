@@ -45,6 +45,10 @@ if(NOT GLAMDB_IO_ONLY)
             glamdb_build_options Arrow::arrow_static)
         target_include_directories(glamdb_metadata_cache_oom PRIVATE "${PROJECT_SOURCE_DIR}")
         target_compile_definitions(glamdb_metadata_cache_oom PRIVATE "GLAMDB_TEST_STORAGE=1")
+        if(GLAMDB_ENABLE_ASAN OR GLAMDB_ENABLE_TSAN OR GLAMDB_ENABLE_MSAN
+            OR "${CMAKE_CXX_FLAGS} ${CMAKE_EXE_LINKER_FLAGS}" MATCHES "-fsanitize=[^ ]*(address|thread|memory|leak)")
+            target_compile_definitions(glamdb_metadata_cache_oom PRIVATE "GLAMDB_HAS_INTERCEPTING_SANITIZER=1")
+        endif()
         gtest_discover_tests(glamdb_metadata_cache_oom TEST_PREFIX glamdb.unit. PROPERTIES LABELS unit TIMEOUT 30)
     endif()
 

@@ -157,7 +157,7 @@ std::shared_ptr<const std::vector<std::shared_ptr<const iceberg::DataFile>>> Rea
     }
     auto sharedFiles = std::make_shared<const std::vector<std::shared_ptr<const iceberg::DataFile>>>(std::move(files));
     if (cache != nullptr) {
-        cache->PutManifest(manifest.manifest_path, manifest.manifest_length, sharedFiles);
+        cache->TryPutManifest(manifest.manifest_path, manifest.manifest_length, sharedFiles);
     }
     return sharedFiles;
 }
@@ -193,7 +193,7 @@ ReadScanRoot(const std::shared_ptr<iceberg::FileIO>& io, const BaseIdentity& bas
                     "read committed root");
             CheckRoot(*metadata, base);
             std::shared_ptr<const iceberg::TableMetadata> shared(std::move(metadata));
-            cache->PutRoot(base.metadata_location, actualSize, shared);
+            cache->TryPutRoot(base.metadata_location, actualSize, shared);
             return shared;
         }
         auto metadata = Take(NGlamDB::NStorage::ReadTableMetadata(*io, base.metadata_location, std::nullopt, limit),
@@ -247,7 +247,7 @@ Result<TScanManifests> PlanManifests(const std::shared_ptr<iceberg::FileIO>& io,
                 return Take(list->Files(), "IO_ERROR", "read manifest list");
             }));
         if (cache != nullptr) {
-            cache->PutManifestList(snapshot->manifest_list, manifests);
+            cache->TryPutManifestList(snapshot->manifest_list, manifests);
         }
         plan.Manifests = *manifests;
         return plan;

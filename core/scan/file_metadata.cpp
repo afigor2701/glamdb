@@ -75,16 +75,12 @@ void CheckFieldIDs(const std::map<int32_t, T>& values, const iceberg::Schema& sc
 {
     for (const auto& entry : values) {
         const auto fieldID = entry.first;
-        const auto& value = entry.second;
         Require(std::ranges::any_of(schema.fields(),
                     [&](const auto& field) {
                         return field.field_id() == fieldID;
                     }),
             "CORRUPTION",
             "Manifest metrics contain an unknown field ID.");
-        if constexpr (std::is_same_v<T, int64_t>) {
-            Require(value >= 0, "CORRUPTION", "Manifest metrics contain a negative count.");
-        }
     }
 }
 
@@ -108,12 +104,34 @@ TDataFileMetadata DescribeFile(const BaseIdentity& base, const iceberg::DataFile
             .NanCount = Lookup(file.nan_value_counts, id),
             .LowerBound = Lookup(file.lower_bounds, id),
             .UpperBound = Lookup(file.upper_bounds, id)};
-        Require((!metrics.CompressedBytes || *metrics.CompressedBytes <= file.file_size_in_bytes) &&
-                (!metrics.ValueCount || *metrics.ValueCount == file.record_count) &&
-                (!metrics.NullCount || *metrics.NullCount <= file.record_count) &&
-                (!metrics.NanCount || *metrics.NanCount <= file.record_count - metrics.NullCount.value_or(0)),
+        Require(!metrics.CompressedBytes ||
+                (*metrics.CompressedBytes >= 0 && *metrics.CompressedBytes <= file.file_size_in_bytes),
             "CORRUPTION",
-            "Manifest field metrics do not match the file.");
+            "Manifest column sizes do not match the file.");
+        // Column statistics are advisory: omit malformed/contradictory counts and
+        // bounds instead of closing readiness when structural file metadata is valid.
+        if (metrics.ValueCount && *metrics.ValueCount != file.record_count) {
+            metrics.ValueCount.reset();
+        }
+        if (metrics.NullCount &&
+            (*metrics.NullCount < 0 || *metrics.NullCount > file.record_count ||
+                (!field.optional() && *metrics.NullCount != 0)))
+        {
+            metrics.NullCount.reset();
+        }
+        if (metrics.NanCount &&
+            (*metrics.NanCount < 0 || *metrics.NanCount > file.record_count - metrics.NullCount.value_or(0)))
+        {
+            metrics.NanCount.reset();
+        }
+        if ((file.record_count <= 0 || (metrics.NullCount && *metrics.NullCount == file.record_count)) &&
+            (metrics.LowerBound || metrics.UpperBound))
+        {
+            metrics.NullCount.reset();
+            metrics.NanCount.reset();
+            metrics.LowerBound.reset();
+            metrics.UpperBound.reset();
+        }
         result.FieldMetrics.push_back(std::move(metrics));
     }
     return result;
@@ -194,19 +212,31 @@ TColumnChunkMetadata DescribeColumn(const parquet::ColumnChunkMetaData& chunk,
             CheckRange(index->offset, index->length, dataEnd);
         }
     }
-    if (const auto stats = chunk.encoded_statistics()) {
-        if (stats->has_null_count) {
-            Require(stats->null_count >= 0 && stats->null_count <= rows,
-                "CORRUPTION",
-                "Parquet null count is outside the row group.");
-            result.NullCount = stats->null_count;
+    try {
+        if (const auto stats = chunk.encoded_statistics()) {
+            const bool optional = column.schema_node()->is_optional();
+            const bool validNullCount = stats->has_null_count && stats->null_count >= 0 && stats->null_count <= rows &&
+                (optional || stats->null_count == 0) && (!stats->all_null_value || stats->null_count == rows);
+            const bool allNull = stats->all_null_value || (validNullCount && stats->null_count == rows);
+            const bool contradictoryBounds = (rows == 0 || allNull) && (stats->has_min || stats->has_max);
+            if (!contradictoryBounds) {
+                if (validNullCount) {
+                    result.NullCount = stats->null_count;
+                }
+                if (!allNull && rows > 0) {
+                    if (stats->has_min) {
+                        result.LowerBound = std::vector<uint8_t>(stats->min().begin(), stats->min().end());
+                    }
+                    if (stats->has_max) {
+                        result.UpperBound = std::vector<uint8_t>(stats->max().begin(), stats->max().end());
+                    }
+                }
+            }
         }
-        if (stats->has_min) {
-            result.LowerBound = std::vector<uint8_t>(stats->min().begin(), stats->min().end());
-        }
-        if (stats->has_max) {
-            result.UpperBound = std::vector<uint8_t>(stats->max().begin(), stats->max().end());
-        }
+    } catch (const parquet::ParquetException&) {
+        result.NullCount.reset();
+        result.LowerBound.reset();
+        result.UpperBound.reset();
     }
     return result;
 }
@@ -216,7 +246,6 @@ std::vector<TRowGroupMetadata> DescribeRowGroups(const parquet::FileMetaData& fo
     const auto dataEnd = file.CompressedBytes - footer.size() - 8;
     std::vector<TRowGroupMetadata> groups;
     std::vector<int64_t> compressed(file.FieldMetrics.size(), 0);
-    std::vector<std::optional<int64_t>> nulls(file.FieldMetrics.size(), 0);
     for (int ordinal = 0; ordinal < footer.num_row_groups(); ++ordinal) {
         const auto group = footer.RowGroup(ordinal);
         TRowGroupMetadata result{.Ordinal = ordinal,
@@ -229,12 +258,6 @@ std::vector<TRowGroupMetadata> DescribeRowGroups(const parquet::FileMetaData& fo
             AddBytes(result.CompressedBytes, descriptor.CompressedBytes);
             AddBytes(uncompressed, descriptor.UncompressedBytes);
             AddBytes(compressed[column], descriptor.CompressedBytes);
-            auto& nullCount = nulls[column];
-            if (nullCount && descriptor.NullCount) {
-                AddBytes(*nullCount, *descriptor.NullCount);
-            } else {
-                nullCount.reset();
-            }
             result.Columns.push_back(std::move(descriptor));
         }
         Require(result.UncompressedBytes == uncompressed,
@@ -244,10 +267,9 @@ std::vector<TRowGroupMetadata> DescribeRowGroups(const parquet::FileMetaData& fo
     }
     for (size_t column = 0; column < file.FieldMetrics.size(); ++column) {
         const auto& metrics = file.FieldMetrics[column];
-        Require((!metrics.CompressedBytes || *metrics.CompressedBytes == compressed[column]) &&
-                (!metrics.NullCount || !nulls[column] || metrics.NullCount == nulls[column]),
+        Require(!metrics.CompressedBytes || *metrics.CompressedBytes == compressed[column],
             "CORRUPTION",
-            "Parquet field metrics differ from the manifest.");
+            "Parquet column sizes differ from the manifest.");
     }
     return groups;
 }
