@@ -273,8 +273,13 @@ iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ParseFooter(std::span<co
                 const auto dataPageOffset = chunk->data_page_offset();
                 const auto chunkStartOffset =
                     chunk->has_dictionary_page() ? chunk->dictionary_page_offset() : dataPageOffset;
-                if (!IsValidDataRange(dataPageOffset, 0, dataEnd) ||
-                    !IsValidDataRange(chunkStartOffset, compressedBytes, dataEnd))
+                const auto chunkEndOffset = IsValidDataRange(chunkStartOffset, compressedBytes, dataEnd)
+                    ? chunkStartOffset + compressedBytes
+                    : -1;
+                if (chunkEndOffset < 0 ||
+                    (chunk->has_dictionary_page() ? dataPageOffset <= chunkStartOffset
+                                                  : dataPageOffset != chunkStartOffset) ||
+                    ((chunk->has_dictionary_page() || rows > 0) && dataPageOffset >= chunkEndOffset))
                 {
                     return iceberg::Invalid("CORRUPTION: Parquet column range is outside the file data.");
                 }

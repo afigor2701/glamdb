@@ -18,7 +18,9 @@
 #include <iceberg/table_metadata.h>
 #include <iceberg/type.h>
 #include <parquet/column_writer.h>
+#include <parquet/file_reader.h>
 #include <parquet/file_writer.h>
+#include <parquet/metadata.h>
 #include <parquet/schema.h>
 #include <zlib.h>
 
@@ -627,6 +629,112 @@ TEST_F(TFormatVerifierTest, ClosesReadStreamsAndPreservesTheFirstError)
             EXPECT_EQ(result.error().message, failRead ? "original read error" : "close error");
             EXPECT_EQ(file.CloseCount, 1);
         }
+    }
+}
+
+std::string EncodeCompactZigZagVarint(std::int64_t value)
+{
+    auto zigzag =
+        (static_cast<std::uint64_t>(value) << 1) ^ static_cast<std::uint64_t>(-static_cast<std::int64_t>(value < 0));
+    std::string out;
+    do {
+        std::uint8_t byte = static_cast<std::uint8_t>(zigzag & 0x7fU);
+        zigzag >>= 7U;
+        if (zigzag != 0) {
+            byte |= 0x80U;
+        }
+        out.push_back(static_cast<char>(byte));
+    } while (zigzag != 0);
+    return out;
+}
+
+TEST_F(TFormatVerifierTest, RejectsDataPageOffsetOutsideDictionaryColumnChunkRange)
+{
+    // Write 6 rows across 3 row groups (max-row-group-rows = 2) so row group 1's
+    // dictionary-encoded chunk has dictionary_page_offset >= 64, data_page_offset >= 64,
+    // and dictionary_page_offset + total_compressed_size < dataEnd (all 2-byte Compact
+    // Thrift varints). Also test the 2-row-group WriteRows fixture directly.
+    ASSERT_NO_FATAL_FAILURE(WriteRows(iceberg::FileFormatType::kParquet, "two_groups.parquet"));
+    {
+        const auto original = ReadBytes("two_groups.parquet");
+        auto reader = parquet::ParquetFileReader::Open(
+            std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(original)));
+        const auto metadata = reader->metadata();
+        ASSERT_EQ(metadata->num_row_groups(), 2);
+        const auto chunk = metadata->RowGroup(1)->ColumnChunk(0);
+        ASSERT_TRUE(chunk->has_dictionary_page());
+        const auto dictOffset = chunk->dictionary_page_offset();
+        const auto dataOffset = chunk->data_page_offset();
+        ASSERT_LT(dictOffset, dataOffset);
+        const std::string needle = std::string("\x26", 1) + EncodeCompactZigZagVarint(dataOffset) +
+            std::string("\x26", 1) + EncodeCompactZigZagVarint(dictOffset);
+        const auto footerStart = original.size() - 8 - static_cast<std::size_t>(metadata->size());
+        const auto pos = original.find(needle, footerStart);
+        ASSERT_NE(pos, std::string::npos);
+
+        for (const std::int64_t badDataOffset : {dictOffset - 1, dictOffset}) {
+            const std::string replacement = std::string("\x26", 1) + EncodeCompactZigZagVarint(badDataOffset) +
+                std::string("\x26", 1) + EncodeCompactZigZagVarint(dictOffset);
+            ASSERT_EQ(replacement.size(), needle.size());
+            auto mutated = original;
+            mutated.replace(pos, needle.size(), replacement);
+            ASSERT_TRUE(IO_->WriteFile("bad_two_groups.parquet", mutated));
+            EXPECT_FALSE(CheckData("bad_two_groups.parquet", 3)) << badDataOffset;
+        }
+    }
+
+    iceberg::WriterOptions options;
+    options.io = IO_;
+    options.path = "three_groups.parquet";
+    options.schema = Schema_;
+    options.properties = iceberg::WriterProperties::FromMap({{"write.parquet.max-row-group-rows", "2"}});
+    auto writer = iceberg::WriterFactoryRegistry::Open(iceberg::FileFormatType::kParquet, options);
+    ASSERT_TRUE(writer) << writer.error().message;
+    arrow::Int64Builder builder;
+    ASSERT_TRUE(builder.AppendValues({1, 2, 3, 4, 5, 6}).ok());
+    auto array = builder.Finish();
+    ASSERT_TRUE(array.ok());
+    auto batch = arrow::RecordBatch::Make(arrow::schema({arrow::field("value", arrow::int64(), false)}), 6, {*array});
+    ArrowArray exported{};
+    ASSERT_TRUE(arrow::ExportRecordBatch(*batch, &exported).ok());
+    const auto written = (*writer)->Write(&exported);
+    if (exported.release != nullptr) {
+        exported.release(&exported);
+    }
+    ASSERT_TRUE(written) << written.error().message;
+    ASSERT_TRUE((*writer)->Close());
+
+    const auto original = ReadBytes("three_groups.parquet");
+    auto reader = parquet::ParquetFileReader::Open(
+        std::make_shared<arrow::io::BufferReader>(arrow::Buffer::FromString(original)));
+    const auto metadata = reader->metadata();
+    ASSERT_EQ(metadata->num_row_groups(), 3);
+    const auto chunk = metadata->RowGroup(1)->ColumnChunk(0);
+    ASSERT_TRUE(chunk->has_dictionary_page());
+    const auto dictOffset = chunk->dictionary_page_offset();
+    const auto dataOffset = chunk->data_page_offset();
+    const auto chunkEnd = dictOffset + chunk->total_compressed_size();
+    const auto dataEnd = static_cast<std::int64_t>(original.size()) - metadata->size() - 8;
+    ASSERT_LT(dictOffset, dataOffset);
+    ASSERT_LT(dataOffset, chunkEnd);
+    ASSERT_LT(chunkEnd, dataEnd);
+
+    const std::string needle = std::string("\x26", 1) + EncodeCompactZigZagVarint(dataOffset) + std::string("\x26", 1) +
+        EncodeCompactZigZagVarint(dictOffset);
+    const auto footerStart = original.size() - 8 - static_cast<std::size_t>(metadata->size());
+    const auto pos = original.find(needle, footerStart);
+    ASSERT_NE(pos, std::string::npos);
+
+    for (const std::int64_t badDataOffset : {dictOffset - 1, dictOffset, chunkEnd, chunkEnd + 1}) {
+        const std::string replacement = std::string("\x26", 1) + EncodeCompactZigZagVarint(badDataOffset) +
+            std::string("\x26", 1) + EncodeCompactZigZagVarint(dictOffset);
+        ASSERT_EQ(replacement.size(), needle.size());
+        auto mutated = original;
+        mutated.replace(pos, needle.size(), replacement);
+        ASSERT_TRUE(IO_->WriteFile("bad_three_groups.parquet", mutated));
+        const auto checked = CheckData("bad_three_groups.parquet", 6);
+        ASSERT_FALSE(checked) << badDataOffset;
+        EXPECT_NE(checked.error().message.find("CORRUPTION"), std::string::npos);
     }
 }
 

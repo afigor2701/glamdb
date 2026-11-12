@@ -205,8 +205,14 @@ TColumnChunkMetadata DescribeColumn(const parquet::ColumnChunkMetaData& chunk,
         Require(stats.count >= 0, "CORRUPTION", "Parquet page encoding count is negative.");
         result.EncodingStats.push_back({PageTypeName(stats.page_type), EncodingName(stats.encoding), stats.count});
     }
-    CheckRange(result.DataPageOffset, 0, dataEnd);
-    CheckRange(result.DictionaryPageOffset.value_or(result.DataPageOffset), result.CompressedBytes, dataEnd);
+    const auto chunkStartOffset = result.DictionaryPageOffset.value_or(result.DataPageOffset);
+    CheckRange(chunkStartOffset, result.CompressedBytes, dataEnd);
+    const auto chunkEndOffset = chunkStartOffset + result.CompressedBytes;
+    Require((result.DictionaryPageOffset ? result.DataPageOffset > chunkStartOffset
+                                         : result.DataPageOffset == chunkStartOffset) &&
+            ((!result.DictionaryPageOffset && rows == 0) || result.DataPageOffset < chunkEndOffset),
+        "CORRUPTION",
+        "Parquet column range is outside the file data.");
     for (const auto& index : {chunk.GetColumnIndexLocation(), chunk.GetOffsetIndexLocation()}) {
         if (index) {
             CheckRange(index->offset, index->length, dataEnd);
