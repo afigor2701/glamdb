@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/engine/storage_backend.h"
+#include "core/resources/envelopes.h"
 #include "core/storage/capacity.h"
 #include "core/storage/data_file_writer.h"
 #include "core/storage/durable_local_file_io.h"
@@ -59,6 +60,8 @@ struct TLocalStorageOptions
     // the same bytes. Defaults to GLAMDB_VERIFY_ROUNDTRIP when set ("0" is
     // off), otherwise on in builds without NDEBUG.
     bool VerifyStagedRoot = DefaultVerifyStagedRoot();
+    uint64_t ReadCacheBytes = ReadCacheMemoryBytes;
+    bool EnablePruning = true;
 
     static bool DefaultVerifyStagedRoot()
     {
@@ -110,6 +113,10 @@ public:
         std::span<const OperationRecord> operations) override;
     Result<std::shared_ptr<iceberg::FileIO>> ReadOnlyFileIO() override;
     Result<std::shared_ptr<const NGlamDB::NStorage::TBaseState>> VerifiedScanState(const BaseIdentity& base) override;
+    std::shared_ptr<TSnapshotMetadataCache> ReadMetadataCache() override
+    {
+        return ReadCache_;
+    }
 
     // A verified candidate is tentative until PublicationFinished confirms the
     // outer COMMIT. Recovery rebuilds the generation independently.
@@ -129,6 +136,7 @@ private:
     const std::shared_ptr<NGlamDB::NIO::TStoreDirs> Dirs_;
     const std::shared_ptr<NGlamDB::NStorage::TDurableLocalFileIO> FileIO_;
     const std::shared_ptr<iceberg::Catalog> Catalog_;
+    const std::shared_ptr<TSnapshotMetadataCache> ReadCache_;
 
     std::mutex Mutex_;
     std::map<std::string, TCollectionState, std::less<>> Collections_;
@@ -144,7 +152,8 @@ private:
     TLocalStorageBackend(StoreInfo store,
         TLocalStorageOptions options,
         std::shared_ptr<NGlamDB::NIO::TStoreDirs> dirs,
-        std::shared_ptr<NGlamDB::NStorage::TDurableLocalFileIO> fileIO);
+        std::shared_ptr<NGlamDB::NStorage::TDurableLocalFileIO> fileIO,
+        std::shared_ptr<TSnapshotMetadataCache> readCache);
 
     void CheckStore(const StoreInfo& store) const;
     // Root identity, warehouse limit and free-space reserve before a write.

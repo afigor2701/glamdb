@@ -167,9 +167,9 @@ void CheckViews(glamdb::Engine& engine, int64_t snapshotA, int64_t snapshotB)
     Check(count == 2, "zero-column scan preserves duplicate matches");
     const auto capabilities = engine.GetCapabilities();
     Check(capabilities.backend == glamdb::BackendKind::LocalStorage && capabilities.metadata && capabilities.scan &&
-            capabilities.append && !capabilities.file_pruning && !capabilities.row_group_pruning &&
+            capabilities.append && capabilities.file_pruning && capabilities.row_group_pruning &&
             !capabilities.durability_qualified,
-        "native capabilities do not claim pruning or qualified durability");
+        "native capabilities report pruning without claiming qualified durability");
     const auto history = Take(engine.ListSnapshots(CollectionId), "snapshot history");
     Check(history.snapshots.size() == 2 && history.snapshots[0].snapshot_id == snapshotA &&
             history.snapshots[1].snapshot_id == snapshotB && history.snapshots[1].parent_snapshot_id == snapshotA,
@@ -222,8 +222,8 @@ void CheckViews(glamdb::Engine& engine, int64_t snapshotA, int64_t snapshotB)
         const auto explanation =
             Take(engine.ExplainScan({.collection_id = CollectionId, .selector = selector}), "explain");
         Check(explanation.info.selector_resolved == stats.selector_resolved &&
-                explanation.candidates.rows.value == rows && !explanation.file_pruning &&
-                !explanation.row_group_pruning && explanation.estimated_output_rows.value == rows,
+                explanation.candidates.rows.value == rows && explanation.file_pruning &&
+                explanation.row_group_pruning && explanation.estimated_output_rows.value == rows,
             "explain uses the selected fixed view");
     }
     auto zero = Take(engine.Scan({.collection_id = CollectionId, .limit = 0}), "zero limit");
@@ -305,7 +305,8 @@ void CheckUnavailable(glamdb::Engine& engine)
 {
     const auto capabilities = engine.GetCapabilities();
     Check(capabilities.backend == glamdb::BackendKind::Unavailable && !capabilities.metadata && !capabilities.scan &&
-            !capabilities.append && !capabilities.durability_qualified,
+            !capabilities.append && !capabilities.file_pruning && !capabilities.row_group_pruning &&
+            !capabilities.durability_qualified,
         "storage-disabled capabilities");
     const auto stats = engine.GetStatistics(CollectionId);
     const auto history = engine.ListSnapshots(CollectionId);

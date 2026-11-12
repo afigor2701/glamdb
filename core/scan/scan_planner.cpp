@@ -4,6 +4,7 @@
 #include "core/api/canonical.h"
 #include "core/backend/storage_errors.h"
 #include "core/scan/buffer_file.h"
+#include "core/scan/metadata_cache.h"
 #include "core/storage/base_state.h"
 #include "core/storage/capacity.h"
 #include "core/storage/format_registry.h"
@@ -111,9 +112,10 @@ void CheckRoot(const iceberg::TableMetadata& metadata, const BaseIdentity& base)
         "only the initial unpartitioned Iceberg v2 schema is supported");
 }
 
-std::vector<std::shared_ptr<iceberg::DataFile>> ReadDataFiles(const TScanManifests& plan,
+std::shared_ptr<const std::vector<std::shared_ptr<const iceberg::DataFile>>> ReadDataFiles(const TScanManifests& plan,
     const std::shared_ptr<iceberg::FileIO>& io,
-    const iceberg::ManifestFile& manifest)
+    const iceberg::ManifestFile& manifest,
+    TSnapshotMetadataCache* cache)
 {
     if (manifest.content != iceberg::ManifestContent::kData) {
         Unsupported("delete manifests are not supported");
@@ -125,6 +127,12 @@ std::vector<std::shared_ptr<iceberg::DataFile>> ReadDataFiles(const TScanManifes
     if (!(*spec)->IsUnpartitioned()) {
         Unsupported("partitioned manifests are not supported");
     }
+    Require(manifest.manifest_length > 0, "CORRUPTION", "committed file has an invalid length");
+    if (cache != nullptr) {
+        if (auto cached = cache->FindManifest(manifest.manifest_path, manifest.manifest_length)) {
+            return cached;
+        }
+    }
     const auto bytes = ReadPersisted(io, manifest.manifest_path, manifest.manifest_length, "read manifest");
     auto reader = DecodePersisted("open manifest", [&] {
         return Take(iceberg::ManifestReader::Make(manifest, bytes, plan.Schema, *spec), "IO_ERROR", "open manifest");
@@ -132,7 +140,8 @@ std::vector<std::shared_ptr<iceberg::DataFile>> ReadDataFiles(const TScanManifes
     const auto entries = DecodePersisted("read manifest", [&] {
         return Take(reader->LiveEntries(), "IO_ERROR", "read manifest");
     });
-    std::vector<std::shared_ptr<iceberg::DataFile>> files;
+    std::vector<std::shared_ptr<const iceberg::DataFile>> files;
+    files.reserve(entries.size());
     for (const auto& entry : entries) {
         const auto& file = entry.data_file;
         Require(file != nullptr, "CORRUPTION", "manifest entry has no data file");
@@ -146,23 +155,52 @@ std::vector<std::shared_ptr<iceberg::DataFile>> ReadDataFiles(const TScanManifes
             "manifest has invalid data file metrics");
         files.push_back(file);
     }
-    return files;
+    auto sharedFiles = std::make_shared<const std::vector<std::shared_ptr<const iceberg::DataFile>>>(std::move(files));
+    if (cache != nullptr) {
+        cache->PutManifest(manifest.manifest_path, manifest.manifest_length, sharedFiles);
+    }
+    return sharedFiles;
 }
 
 } // namespace
 
-Result<std::unique_ptr<iceberg::TableMetadata>> ReadScanRoot(const std::shared_ptr<iceberg::FileIO>& io,
-    const BaseIdentity& base)
+Result<std::shared_ptr<const iceberg::TableMetadata>>
+ReadScanRoot(const std::shared_ptr<iceberg::FileIO>& io, const BaseIdentity& base, TSnapshotMetadataCache* cache)
 {
     try {
         Require(io != nullptr, "DEPENDENCY_UNAVAILABLE", "storage reader is not installed");
         NGlamDB::NStorage::RegisterStorageFormats();
         const auto limit = static_cast<int64_t>(NGlamDB::NStorage::TStorageLimits{}.RootBytes);
+        if (cache != nullptr) {
+            if (!base.metadata_location.ends_with(".metadata.json")) {
+                throw Failure(StorageError(
+                    iceberg::InvalidArgument("Metadata verification requires an uncompressed JSON file.").error(),
+                    "read committed root",
+                    EStoragePath::Read,
+                    "IO_ERROR"));
+            }
+            auto file = Take(io->NewInputFile(base.metadata_location), "IO_ERROR", "read committed root");
+            const auto actualSize = Take(file->Size(), "IO_ERROR", "read committed root");
+            if (actualSize >= 0 && actualSize <= limit) {
+                if (auto cached = cache->FindRoot(base.metadata_location, actualSize)) {
+                    CheckRoot(*cached, base);
+                    return cached;
+                }
+            }
+            auto metadata =
+                Take(NGlamDB::NStorage::ReadTableMetadataFromInput(*file, base.metadata_location, actualSize, limit),
+                    "IO_ERROR",
+                    "read committed root");
+            CheckRoot(*metadata, base);
+            std::shared_ptr<const iceberg::TableMetadata> shared(std::move(metadata));
+            cache->PutRoot(base.metadata_location, actualSize, shared);
+            return shared;
+        }
         auto metadata = Take(NGlamDB::NStorage::ReadTableMetadata(*io, base.metadata_location, std::nullopt, limit),
             "IO_ERROR",
             "read committed root");
         CheckRoot(*metadata, base);
-        return metadata;
+        return std::shared_ptr<const iceberg::TableMetadata>(std::move(metadata));
     } catch (const Failure& error) {
         return std::unexpected(error.detail);
     } catch (const std::bad_alloc& error) {
@@ -173,11 +211,13 @@ Result<std::unique_ptr<iceberg::TableMetadata>> ReadScanRoot(const std::shared_p
     }
 }
 
-Result<TScanManifests>
-PlanManifests(const std::shared_ptr<iceberg::FileIO>& io, const BaseIdentity& base, const SnapshotSelector& selector)
+Result<TScanManifests> PlanManifests(const std::shared_ptr<iceberg::FileIO>& io,
+    const BaseIdentity& base,
+    const SnapshotSelector& selector,
+    TSnapshotMetadataCache* cache)
 {
     try {
-        const auto root = ReadScanRoot(io, base);
+        const auto root = ReadScanRoot(io, base, cache);
         if (!root) {
             return std::unexpected(root.error());
         }
@@ -190,15 +230,26 @@ PlanManifests(const std::shared_ptr<iceberg::FileIO>& io, const BaseIdentity& ba
         plan.SnapshotID = snapshot->snapshot_id;
         plan.Schema = Take(metadata->Schema(), "CORRUPTION", "table schema");
         plan.Specs = metadata->partition_specs;
+        if (cache != nullptr) {
+            if (auto cachedList = cache->FindManifestList(snapshot->manifest_list)) {
+                plan.Manifests = *cachedList;
+                return plan;
+            }
+        }
         const auto listBytes = ReadPersisted(io, snapshot->manifest_list, std::nullopt, "read manifest list");
         const auto list = DecodePersisted("open manifest list", [&] {
             return Take(iceberg::ManifestListReader::Make(snapshot->manifest_list, listBytes),
                 "IO_ERROR",
                 "open manifest list");
         });
-        plan.Manifests = DecodePersisted("read manifest list", [&] {
-            return Take(list->Files(), "IO_ERROR", "read manifest list");
-        });
+        auto manifests =
+            std::make_shared<const std::vector<iceberg::ManifestFile>>(DecodePersisted("read manifest list", [&] {
+                return Take(list->Files(), "IO_ERROR", "read manifest list");
+            }));
+        if (cache != nullptr) {
+            cache->PutManifestList(snapshot->manifest_list, manifests);
+        }
+        plan.Manifests = *manifests;
         return plan;
     } catch (const Failure& error) {
         return std::unexpected(error.detail);
@@ -257,18 +308,20 @@ PlanVerifiedScan(const NGlamDB::NStorage::TBaseState& state, const BaseIdentity&
     }
 }
 
-Result<std::vector<TScanFile>>
-ManifestFiles(const std::shared_ptr<iceberg::FileIO>& io, const TScanManifests& plan, size_t index)
+Result<std::vector<TScanFile>> ManifestFiles(const std::shared_ptr<iceberg::FileIO>& io,
+    const TScanManifests& plan,
+    size_t index,
+    TSnapshotMetadataCache* cache)
 {
-    auto data = ReadManifestDataFiles(io, plan, index);
+    auto data = ReadManifestDataFiles(io, plan, index, cache);
     if (!data) {
         return std::unexpected(data.error());
     }
     try {
         std::vector<TScanFile> files;
-        files.reserve(data->size());
-        for (const auto& file : *data) {
-            files.push_back({file->file_path, file->file_size_in_bytes, file->record_count});
+        files.reserve((*data)->size());
+        for (const auto& file : **data) {
+            files.push_back({file->file_path, file->file_size_in_bytes, file->record_count, file});
         }
         return files;
     } catch (const std::bad_alloc& error) {
@@ -277,13 +330,16 @@ ManifestFiles(const std::shared_ptr<iceberg::FileIO>& io, const TScanManifests& 
     }
 }
 
-Result<std::vector<std::shared_ptr<iceberg::DataFile>>>
-ReadManifestDataFiles(const std::shared_ptr<iceberg::FileIO>& io, const TScanManifests& plan, size_t index)
+Result<std::shared_ptr<const std::vector<std::shared_ptr<const iceberg::DataFile>>>> ReadManifestDataFiles(
+    const std::shared_ptr<iceberg::FileIO>& io,
+    const TScanManifests& plan,
+    size_t index,
+    TSnapshotMetadataCache* cache)
 {
     try {
         Require(io != nullptr, "DEPENDENCY_UNAVAILABLE", "storage reader is not installed");
         Require(index < plan.Manifests.size(), "INTERNAL", "manifest index is out of range");
-        return ReadDataFiles(plan, io, plan.Manifests[index]);
+        return ReadDataFiles(plan, io, plan.Manifests[index], cache);
     } catch (const Failure& error) {
         return std::unexpected(error.detail);
     } catch (const std::bad_alloc& error) {
@@ -294,16 +350,18 @@ ReadManifestDataFiles(const std::shared_ptr<iceberg::FileIO>& io, const TScanMan
     }
 }
 
-Result<TScanPlan>
-PlanScan(const std::shared_ptr<iceberg::FileIO>& io, const BaseIdentity& base, const SnapshotSelector& selector)
+Result<TScanPlan> PlanScan(const std::shared_ptr<iceberg::FileIO>& io,
+    const BaseIdentity& base,
+    const SnapshotSelector& selector,
+    TSnapshotMetadataCache* cache)
 {
-    auto manifests = PlanManifests(io, base, selector);
+    auto manifests = PlanManifests(io, base, selector, cache);
     if (!manifests) {
         return std::unexpected(manifests.error());
     }
     TScanPlan plan{manifests->SnapshotID, {}};
     for (size_t index = 0; index < manifests->Manifests.size(); ++index) {
-        auto files = ManifestFiles(io, *manifests, index);
+        auto files = ManifestFiles(io, *manifests, index, cache);
         if (!files) {
             return std::unexpected(files.error());
         }

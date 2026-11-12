@@ -6,7 +6,10 @@ there is no persisted auxiliary index or storage migration.
 
 Each immutable `TBaseState` binds the exact metadata location, parsed root,
 verified usage and a `TScanMembership`. The index stores each data-file
-descriptor once in chronological order. A sorted snapshot-ID table identifies
+descriptor once in chronological order, retaining the verified
+`std::shared_ptr<const iceberg::DataFile>` (while keeping membership equality on
+`{Path, SizeBytes, RecordCount}`) so indexed scans can evaluate manifest column
+bounds and null counts without reopening manifests. A sorted snapshot-ID table identifies
 each retained snapshot's prefix boundary. IDs are opaque; sorting IDs is only
 for lookup. Scanning reverses the selected prefix to preserve the manifest
 order produced by fast append. Initial-empty views select zero files.
@@ -39,11 +42,14 @@ their immutable membership and normal data-read/error behavior.
 
 Healthy `Engine::Scan` planning performs no root, manifest-list or manifest I/O.
 It selects a boundary in O(log retained snapshots), without copying the file
-prefix. `limit=0` opens no data file. Data-file footer and decoded-value checks
-still run during execution. Cursor `manifests_read` is measured zero for indexed
-scans. The uncached planner remains available for custom backends and component
-tests. Metadata/history/file-detail APIs still read authoritative metadata;
-neither cached planning nor recovery is a full data-page scrub.
+prefix. `limit=0` opens no data file, and candidate files proven non-matching by
+manifest bounds are pruned (`data_files_pruned`) before opening Parquet. Surviving
+data-file footers (reusing the bounded per-store `TSnapshotMetadataCache` on
+repeated scans) and decoded-value checks still run during execution. Cursor `manifests_read` is measured zero for indexed
+scans. The non-indexed planner remains available for custom backends and component
+tests. `ListSnapshots` and `GetFileDetails` still read authoritative files directly,
+while `GetStatistics`, `ListFiles` and `ExplainScan` may reuse immutable entries in
+`TSnapshotMetadataCache`; neither cached planning nor recovery is a full data-page scrub.
 
 ## Cost and reproduction
 
@@ -67,9 +73,10 @@ build/release/tests/glamdb_scan_index_bench 256 1000
 Each run creates a disposable native store with duplicate/NULL rows, compares
 indexed and uncached planning, counts metadata opens, then closes and reopens
 the engine. Reopen is cold with respect to engine state; the OS page cache is
-not flushed. `index_capacity_bytes` counts the index object and retained vector
+not flushed. `index_capacity_bytes` counts `TScanMembership`'s own object, vector
 and path-string capacities, excluding allocator rounding, shared-pointer control
-blocks, parsed roots/manifests, FileIO instrumentation and process RSS.
+blocks, shared `iceberg::DataFile` descriptors (emitted separately as
+`datafile_descriptor_bytes`), parsed roots/manifests, FileIO instrumentation and process RSS.
 
 These measurements use the initial implementation on official base `1f48601`.
 

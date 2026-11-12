@@ -892,6 +892,121 @@ TEST_F(ScanMockTest, LeaseBufferRetainsStoreLeaseForFilteredBatches)
     EXPECT_EQ(lease.use_count(), 1);
 }
 
+TEST_F(ScanMockTest, PrunesFilesAndRowGroupsWithUnprunedParity)
+{
+    auto profile = NGlamDB::NStorage::MakeTableProfile(ToStorageSchema(Schema));
+    ASSERT_TRUE(profile.has_value());
+    auto meta0 = iceberg::TableMetadata::Make(*profile->Schema,
+        *iceberg::PartitionSpec::Unpartitioned(),
+        *iceberg::SortOrder::Unsorted(),
+        Table_,
+        profile->Properties);
+    ASSERT_TRUE(meta0.has_value());
+    const auto root0 = Table_ + "/metadata/00020-p0.metadata.json";
+    ASSERT_TRUE(iceberg::TableMetadataUtil::Write(*IO_, root0, **meta0).has_value());
+
+    const auto writeWithMetrics = [&](const std::string& path,
+                                      const std::vector<Row>& rows,
+                                      int64_t maxRowGroupRows) -> std::shared_ptr<iceberg::DataFile> {
+        const auto batch = MakeRecordBatch(Schema, rows);
+        EXPECT_TRUE(batch);
+        auto schema = (*meta0)->Schema();
+        EXPECT_TRUE(schema.has_value());
+        iceberg::WriterOptions options;
+        options.path = path;
+        options.io = IO_;
+        options.schema = *schema;
+        options.metrics_config = *iceberg::MetricsConfig::Make((*meta0)->properties.configs());
+        options.properties =
+            iceberg::WriterProperties::FromMap({{"write.parquet.max-row-group-rows", std::to_string(maxRowGroupRows)}});
+        auto writer = iceberg::WriterFactoryRegistry::Open(iceberg::FileFormatType::kParquet, options);
+        EXPECT_TRUE(writer.has_value());
+        ArrowArray exported{};
+        EXPECT_TRUE(arrow::ExportRecordBatch(**batch, &exported).ok());
+        EXPECT_TRUE((*writer)->Write(&exported).has_value());
+        if (exported.release != nullptr) {
+            exported.release(&exported);
+        }
+        EXPECT_TRUE((*writer)->Close().has_value());
+        const auto metrics = (*writer)->metrics();
+        EXPECT_TRUE(metrics.has_value());
+
+        auto file = std::make_shared<iceberg::DataFile>();
+        file->file_path = path;
+        file->file_format = iceberg::FileFormatType::kParquet;
+        file->content = iceberg::DataFile::Content::kData;
+        file->record_count = (*batch)->num_rows();
+        file->file_size_in_bytes = static_cast<int64_t>(IO_->Files.at(path).size());
+        file->partition_spec_id = (*meta0)->default_spec_id;
+        file->sort_order_id = (*meta0)->default_sort_order_id;
+        file->value_counts = {metrics->value_counts.begin(), metrics->value_counts.end()};
+        file->null_value_counts = {metrics->null_value_counts.begin(), metrics->null_value_counts.end()};
+        file->nan_value_counts = {metrics->nan_value_counts.begin(), metrics->nan_value_counts.end()};
+        for (const auto& [id, lit] : metrics->lower_bounds) {
+            file->lower_bounds[id] = *lit.Serialize();
+        }
+        for (const auto& [id, lit] : metrics->upper_bounds) {
+            file->upper_bounds[id] = *lit.Serialize();
+        }
+        return file;
+    };
+
+    const auto fileLow = Table_ + "/data/p-low.parquet";
+    const auto fileMulti = Table_ + "/data/p-multi.parquet";
+    const std::vector<Row> lowRows{
+        {std::string("a1"), true, int64_t{1}, 1.0, TimestampUs{10}},
+        {std::string("a2"), false, int64_t{2}, 2.0, TimestampUs{20}},
+    };
+    const std::vector<Row> multiRows{
+        {std::string("m1"), true, int64_t{10}, 10.0, TimestampUs{100}},
+        {std::string("m2"), true, int64_t{11}, 11.0, TimestampUs{110}},
+        {std::string("m3"), std::monostate{}, std::monostate{}, std::monostate{}, std::monostate{}},
+        {std::string("m4"), false, int64_t{50}, 50.0, TimestampUs{500}},
+    };
+    const auto meta1 = Append(**meta0, root0, writeWithMetrics(fileLow, lowRows, 2));
+    const auto root1 = Table_ + "/metadata/00021-p1.metadata.json";
+    ASSERT_TRUE(iceberg::TableMetadataUtil::Write(*IO_, root1, *meta1).has_value());
+    const auto meta2 = Append(*meta1, root1, writeWithMetrics(fileMulti, multiRows, 2));
+    const auto root2 = Table_ + "/metadata/00022-p2.metadata.json";
+    ASSERT_TRUE(iceberg::TableMetadataUtil::Write(*IO_, root2, *meta2).has_value());
+
+    Base_ = {StoreId, CollectionId, meta2->table_uuid, root2, meta2->current_snapshot_id, 0, 0};
+    Collection_ = {CollectionId, "events", meta2->table_uuid, Schema, 1, meta2->current_snapshot_id};
+
+    // File `p-low.parquet` has count in [1, 2]; `p-multi.parquet` has RG0 [10, 11] and RG1 [50, 50] + NULL.
+    bool touchedLow = false;
+    IO_->OnRead = [&](const std::string& path) {
+        if (path == fileLow) {
+            touchedLow = true;
+        }
+    };
+    auto prunedCtx = Context();
+    auto prunedRes = OpenScan(std::move(prunedCtx),
+        {.collection_id = CollectionId,
+            .projection = std::vector<std::string>{"key"},
+            .predicate = Predicate::Compare("count", CompareOp::Ge, int64_t{40})});
+    ASSERT_TRUE(prunedRes) << prunedRes.error().message;
+    const auto prunedRows = Drain(**prunedRes);
+    IO_->OnRead = nullptr;
+    EXPECT_FALSE(touchedLow);
+    EXPECT_EQ(prunedRows, std::vector<std::string>{"m4"});
+    EXPECT_EQ((*prunedRes)->Profile().data_files_read.value, 1);
+    EXPECT_EQ((*prunedRes)->Profile().rows_decoded.value, 2);
+    EXPECT_EQ((*prunedRes)->Profile().rows_returned.value, 1);
+
+    auto unprunedCtx = Context();
+    unprunedCtx.EnableFilePruning = false;
+    unprunedCtx.EnableRowGroupPruning = false;
+    auto unprunedRes = OpenScan(std::move(unprunedCtx),
+        {.collection_id = CollectionId,
+            .projection = std::vector<std::string>{"key"},
+            .predicate = Predicate::Compare("count", CompareOp::Ge, int64_t{40})});
+    ASSERT_TRUE(unprunedRes) << unprunedRes.error().message;
+    EXPECT_EQ(Drain(**unprunedRes), prunedRows);
+    EXPECT_EQ((*unprunedRes)->Profile().data_files_read.value, 2);
+    EXPECT_EQ((*unprunedRes)->Profile().rows_decoded.value, 6);
+}
+
 // ---- Error classification table (see SCANNER.md) ----
 
 TEST(StorageErrorClassification, FilesystemErrors)

@@ -23,7 +23,8 @@ concurrent snapshot readers. Power-loss durability qualification is still pendin
   including duplicate keys.
 - **Snapshot reads.** Query the latest committed view or a retained historical
   snapshot. Select columns, limit results, and combine comparisons, membership,
-  and NULL predicates with AND, OR, and NOT.
+  and NULL predicates with AND, OR, and NOT; scans prune candidate files and
+  Parquet row groups conservatively and read only needed column ranges.
 - **Explicit write outcomes.** Persistent operation IDs support exact retries
   and outcome lookup after restart. Writes distinguish committed, definitely
   not committed, and unknown outcomes.
@@ -48,7 +49,7 @@ Current work focuses on qualifying and improving the existing append engine:
 - Performance and concurrent sessions: configurable scan quotas, lower append
   overhead, and measured capacity limits
   ([#109](https://github.com/glamourdb/glamdb/issues/109)).
-- Bounded Parquet reads and file/row-group pruning for selective scans
+- Page-level and Bloom-filter pruning and broader scan memory qualification
   ([#46](https://github.com/glamourdb/glamdb/issues/46)).
 
 ### Planned

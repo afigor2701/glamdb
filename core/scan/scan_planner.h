@@ -24,8 +24,11 @@ struct TBaseState;
 
 namespace glamdb::detail {
 
-Result<std::unique_ptr<iceberg::TableMetadata>> ReadScanRoot(const std::shared_ptr<iceberg::FileIO>& io,
-    const BaseIdentity& base);
+class TSnapshotMetadataCache;
+
+Result<std::shared_ptr<const iceberg::TableMetadata>> ReadScanRoot(const std::shared_ptr<iceberg::FileIO>& io,
+    const BaseIdentity& base,
+    TSnapshotMetadataCache* cache = nullptr);
 
 using TScanFile = NGlamDB::NStorage::TScanDataFile;
 
@@ -53,22 +56,31 @@ struct TScanManifests
 // Resolves the selector once against the committed root of `base` and reads
 // that snapshot's manifest list. Warehouse directories are never listed, so
 // orphan and unpublished files are not visible.
-Result<TScanManifests>
-PlanManifests(const std::shared_ptr<iceberg::FileIO>& io, const BaseIdentity& base, const SnapshotSelector& selector);
+Result<TScanManifests> PlanManifests(const std::shared_ptr<iceberg::FileIO>& io,
+    const BaseIdentity& base,
+    const SnapshotSelector& selector,
+    TSnapshotMetadataCache* cache = nullptr);
 
 Result<TScanManifests> PlanVerifiedScan(const NGlamDB::NStorage::TBaseState& state,
     const BaseIdentity& base,
     const SnapshotSelector& selector);
 
 // The live data files of one planned manifest.
-Result<std::vector<TScanFile>>
-ManifestFiles(const std::shared_ptr<iceberg::FileIO>& io, const TScanManifests& plan, size_t index);
+Result<std::vector<TScanFile>> ManifestFiles(const std::shared_ptr<iceberg::FileIO>& io,
+    const TScanManifests& plan,
+    size_t index,
+    TSnapshotMetadataCache* cache = nullptr);
 
-Result<std::vector<std::shared_ptr<iceberg::DataFile>>>
-ReadManifestDataFiles(const std::shared_ptr<iceberg::FileIO>& io, const TScanManifests& plan, size_t index);
+Result<std::shared_ptr<const std::vector<std::shared_ptr<const iceberg::DataFile>>>> ReadManifestDataFiles(
+    const std::shared_ptr<iceberg::FileIO>& io,
+    const TScanManifests& plan,
+    size_t index,
+    TSnapshotMetadataCache* cache = nullptr);
 
 // PlanManifests followed by every manifest's files.
-Result<TScanPlan>
-PlanScan(const std::shared_ptr<iceberg::FileIO>& io, const BaseIdentity& base, const SnapshotSelector& selector);
+Result<TScanPlan> PlanScan(const std::shared_ptr<iceberg::FileIO>& io,
+    const BaseIdentity& base,
+    const SnapshotSelector& selector,
+    TSnapshotMetadataCache* cache = nullptr);
 
 } // namespace glamdb::detail

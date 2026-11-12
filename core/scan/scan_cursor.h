@@ -20,6 +20,8 @@ struct TBaseState;
 
 namespace glamdb::detail {
 
+class TSnapshotMetadataCache;
+
 struct TScanContext
 {
     std::shared_ptr<ResourceOwner> Resources{};
@@ -27,6 +29,7 @@ struct TScanContext
     // The committed view resolved once by the engine.
     BaseIdentity Base;
     std::shared_ptr<iceberg::FileIO> FileIO;
+    std::shared_ptr<TSnapshotMetadataCache> Cache{};
     // Aliases the engine's closing flag and retains the engine state, its
     // catalog and store lease until the cursor is released.
     std::shared_ptr<const std::atomic<bool>> Closing;
@@ -36,6 +39,8 @@ struct TScanContext
     // Optional owned upstream allocator for decoded and filtered Arrow buffers.
     // A per-scan resource pool wraps it; empty selects Arrow's default pool.
     std::shared_ptr<arrow::MemoryPool> Pool{};
+    bool EnableFilePruning = true;
+    bool EnableRowGroupPruning = true;
     std::function<void(const ErrorDetail&)> OnError;
     std::shared_ptr<const NGlamDB::NStorage::TBaseState> VerifiedState{};
 };

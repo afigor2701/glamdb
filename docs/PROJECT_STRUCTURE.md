@@ -78,7 +78,7 @@ glamdb/
 | `core/api/`, `core/catalog/`, `core/engine/` | `glamdb_core` / `glamdb::core`: canonical input, SQLite catalog, coordinator, and public facade. |
 | `core/backend/` | Storage backend bridging the coordinator seam to `glamdb_storage` (built with `GLAMDB_BUILD_STORAGE`). |
 | `core/resources/` | Shared memory/device owner, Arrow pools and conservative working envelopes. |
-| `core/scan/` | Predicate evaluation (always built), snapshot planning and Parquet scan cursor (storage builds). |
+| `core/scan/` | Predicate evaluation (always built), conservative zone pruning, snapshot planning, bounded metadata/footer cache and positional Parquet scan cursor (storage builds). |
 | `core/telemetry/` | Internal `glamdb_logging`: bounded typed operational JSON, actual process counters and runtime-collected stderr. |
 | `deploy/logging/`, `tools/logging/` | Pinned collection/storage/search stack, Python control-plane logger and ingestion/redaction probes. |
 | `core/io/` | Independent `glamdb_io`: local filesystem, store directories/URIs, attempts, receipts, SHA-256, durable files and copying. |
@@ -136,7 +136,7 @@ files for every anticipated module. The intended responsibilities are:
 The public facade and catalog/coordinator are implemented. With
 `GLAMDB_BUILD_STORAGE` (default unless IO-only), `core/backend/` installs the real
 storage backend behind `core/engine/storage_backend.h` and `core/scan/` serves
-`Engine::Scan` with compound SQL three-valued predicates (without file/row-group pruning). Installed public headers work without private headers.
+`Engine::Scan` with compound SQL three-valued predicates, positional Parquet column/row-group reads, conservative manifest/row-group pruning and bounded immutable metadata/footer caching. Installed public headers work without private headers.
 `GLAMDB_IO_ONLY=ON` builds independent I/O and logging without the engine or CLI; the default
 full build preserves the installed `glamdb::core` package.
 Transport, SDK, and UI dependencies stay outside `public/storage/` and `core/`;

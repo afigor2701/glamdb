@@ -3,10 +3,11 @@
 
 #include "core/api/binary.h"
 #include "core/api/canonical.h"
-#include "core/backend/storage_errors.h"
 #include "core/engine/storage_mapping.h"
-#include "core/scan/buffer_file.h"
+#include "core/scan/metadata_cache.h"
+#include "core/scan/parquet_input.h"
 #include "core/scan/predicate.h"
+#include "core/scan/pruning.h"
 #include "core/scan/scan_planner.h"
 #include "core/storage/format_verifier.h"
 #include "core/storage/table_profile.h"
@@ -16,11 +17,12 @@
 #include "storage/resources.h"
 
 #include <arrow/api.h>
-#include <arrow/io/memory.h>
 #include <iceberg/file_io.h>
 #include <parquet/arrow/reader.h>
+#include <parquet/exception.h>
 #include <parquet/file_reader.h>
 #include <parquet/metadata.h>
+#include <parquet/properties.h>
 #include <parquet/schema.h>
 
 #include <algorithm>
@@ -56,6 +58,9 @@ void RequireInput(bool condition, std::string_view message)
 void CheckArrow(const arrow::Status& status, std::string_view code, std::string_view context)
 {
     if (!status.ok()) {
+        if (status.IsCancelled()) {
+            throw Failure({"CANCELLED", status.ToString(), RetryHint::OperatorAction});
+        }
         Fail(status.IsOutOfMemory() ? "RESOURCE_EXHAUSTED" : code, context, status.ToString());
     }
 }
@@ -65,16 +70,6 @@ T TakeArrow(arrow::Result<T> result, std::string_view code, std::string_view con
 {
     CheckArrow(result.status(), code, context);
     return std::move(result).ValueUnsafe();
-}
-
-// Every path a cursor reads comes from committed metadata.
-template <class T>
-T TakeIceberg(iceberg::Result<T> result, std::string_view code, std::string_view context)
-{
-    if (!result) {
-        throw Failure(StorageError(result.error(), context, EStoragePath::Read, code));
-    }
-    return std::move(*result);
 }
 
 // Limits of the canonical input (see core/api/canonical.cpp); stored values
@@ -129,16 +124,30 @@ void ValidateColumn(const FieldSpec& field, const arrow::Array& array)
     }
 }
 
-template <class TFunction>
-decltype(auto) DecodeParquet(std::string_view context, TFunction&& fn)
+template <typename TFunction>
+decltype(auto)
+DecodeParquetWithSource(const std::shared_ptr<TScanRandomAccessFile>& source, std::string_view context, TFunction&& fn)
 {
+    const auto rethrowSourceError = [&] {
+        if (source) {
+            if (auto err = source->LastError()) {
+                throw Failure(std::move(*err));
+            }
+        }
+    };
     try {
-        return fn();
+        return std::forward<TFunction>(fn)();
     } catch (const Failure&) {
+        rethrowSourceError();
         throw;
+    } catch (const parquet::ParquetStatusException& error) {
+        rethrowSourceError();
+        CheckArrow(error.status(), "CORRUPTION", context);
+        Fail("CORRUPTION", context, error.what());
     } catch (const std::bad_alloc& error) {
         Fail("RESOURCE_EXHAUSTED", context, error.what());
     } catch (const std::exception& error) {
+        rethrowSourceError();
         Fail("CORRUPTION", context, error.what());
     }
 }
@@ -325,7 +334,12 @@ public:
             }
             Release();
             if (State_ == ScanState::Open) {
-                State_ = error.detail.code == "CANCELLED" ? ScanState::Cancelled : ScanState::Failed;
+                if (error.detail.code == "CANCELLED") {
+                    CancellationStopped_ = true;
+                    State_ = ScanState::Cancelled;
+                } else {
+                    State_ = ScanState::Failed;
+                }
             }
             if (Context_.OnError) {
                 Context_.OnError(error.detail);
@@ -367,15 +381,15 @@ public:
         ScanProfile profile{.state = State_,
             .manifests_read = {ManifestsRead_, MetricKind::Measured},
             .data_files_read = {DataFilesRead_, MetricKind::Measured},
-            .data_bytes_read = {DataBytesRead_, MetricKind::Measured},
+            .data_bytes_read = {DataBytesRead_->load(std::memory_order_relaxed), MetricKind::Measured},
             .rows_decoded = {RowsDecoded_, MetricKind::Measured},
             .rows_returned = {RowsReturned_, MetricKind::Measured},
             .rows_filtered = {RowsFiltered_, MetricKind::Measured},
             .rows_limited = {RowsLimited_, MetricKind::Measured},
             .limit_stops = {LimitStopped_ ? 1 : 0, MetricKind::Measured},
             .cancellation_stops = {CancellationStopped_ ? 1 : 0, MetricKind::Measured},
-            .data_files_pruned = {0, MetricKind::Measured},
-            .row_groups_pruned = {0, MetricKind::Measured},
+            .data_files_pruned = {DataFilesPruned_, MetricKind::Measured},
+            .row_groups_pruned = {RowGroupsPruned_, MetricKind::Measured},
             .arrow_bytes = {Pool_->bytes_allocated(), MetricKind::Measured},
             .peak_arrow_bytes = {Pool_->max_memory(), MetricKind::Measured},
             .output_metadata_bytes = {OutputUsage_->Bytes.load(), MetricKind::Measured},
@@ -418,11 +432,13 @@ private:
     ScanState State_ = ScanState::Open;
     int64_t ManifestsRead_ = 0;
     int64_t DataFilesRead_ = 0;
-    int64_t DataBytesRead_ = 0;
+    const std::shared_ptr<std::atomic<int64_t>> DataBytesRead_ = std::make_shared<std::atomic<int64_t>>(0);
     int64_t RowsDecoded_ = 0;
     int64_t RowsReturned_ = 0;
     int64_t RowsFiltered_ = 0;
     int64_t RowsLimited_ = 0;
+    int64_t DataFilesPruned_ = 0;
+    int64_t RowGroupsPruned_ = 0;
     bool LimitStopped_ = false;
     bool CancellationStopped_ = false;
     std::atomic<bool> Cancelled_{false};
@@ -431,6 +447,7 @@ private:
     size_t NextIndexedFile_ = 0;
     std::shared_ptr<ResourceReservation> PendingMemory_;
     std::deque<TScanFile> PendingFiles_;
+    std::shared_ptr<TScanRandomAccessFile> FileSource_;
     // A RecordBatchReader must not outlive its FileReader; members are
     // destroyed in reverse order.
     std::unique_ptr<parquet::arrow::FileReader> FileReader_;
@@ -451,6 +468,29 @@ private:
     {
         BatchReader_.reset();
         FileReader_.reset();
+        if (FileSource_) {
+            (void)FileSource_->Abort();
+            FileSource_.reset();
+        }
+        FileMemory_.reset();
+    }
+
+    void FinishFile()
+    {
+        BatchReader_.reset();
+        FileReader_.reset();
+        if (FileSource_) {
+            auto source = std::move(FileSource_);
+            CheckActive();
+            if (auto err = source->LastError()) {
+                throw Failure(std::move(*err));
+            }
+            auto closed = source->CloseStream();
+            if (!closed) {
+                throw Failure(std::move(closed.error()));
+            }
+            CheckActive();
+        }
         FileMemory_.reset();
     }
 
@@ -487,7 +527,7 @@ private:
                 while (PendingFiles_.empty() && NextManifest_ < Plan_.Manifests.size()) {
                     CheckActive();
                     auto memory = ReserveAdmission(ResourceClass::Metadata, 256ULL << 20);
-                    auto files = Take(ManifestFiles(Context_.FileIO, Plan_, NextManifest_++));
+                    auto files = Take(ManifestFiles(Context_.FileIO, Plan_, NextManifest_++, Context_.Cache.get()));
                     ++ManifestsRead_;
                     CheckActive();
                     PendingMemory_ = std::move(memory);
@@ -498,6 +538,23 @@ private:
                 if (PendingFiles_.empty()) {
                     break;
                 }
+                if (PendingFiles_.front().DataFile != nullptr) {
+                    const auto fileStats = Take(ExtractFileZoneStats(*PendingFiles_.front().DataFile,
+                        *FileSchema_,
+                        Context_.Collection.schema,
+                        ReadFields_));
+                    if (Context_.EnableFilePruning &&
+                        Take(CanPruneZone(Predicate_, PendingFiles_.front().RecordCount, ReadFields_, fileStats)))
+                    {
+                        ++DataFilesPruned_;
+                        PendingFiles_.pop_front();
+                        if (PendingFiles_.empty()) {
+                            PendingMemory_.reset();
+                        }
+                        CheckActive();
+                        continue;
+                    }
+                }
                 outputMemory = ReserveAdmission(ResourceClass::Metadata,
                     4096 + static_cast<uint64_t>(OutputFields_.size()) * 2048);
                 OpenFile(PendingFiles_.front());
@@ -505,17 +562,25 @@ private:
                 if (PendingFiles_.empty()) {
                     PendingMemory_.reset();
                 }
+                if (!BatchReader_) {
+                    continue;
+                }
             }
             if (!outputMemory) {
                 outputMemory = ReserveAdmission(ResourceClass::Metadata,
                     4096 + static_cast<uint64_t>(OutputFields_.size()) * 2048);
             }
             std::shared_ptr<arrow::RecordBatch> batch;
-            DecodeParquet("read Parquet batch", [&] {
+            DecodeParquetWithSource(FileSource_, "read Parquet batch", [&] {
                 CheckArrow(BatchReader_->ReadNext(&batch), "CORRUPTION", "read Parquet batch");
             });
+            if (FileSource_) {
+                if (auto err = FileSource_->LastError()) {
+                    throw Failure(std::move(*err));
+                }
+            }
             if (!batch) {
-                ReleaseFile();
+                FinishFile();
                 continue;
             }
             RowsDecoded_ += batch->num_rows();
@@ -539,35 +604,74 @@ private:
 
     void OpenFile(const TScanFile& file)
     {
-        // Reserve before FileIO creates the std::string and the upstream
-        // footer parser materializes metadata. Arrow decoding is charged by Pool_.
         RequireInput(file.SizeBytes >= 0 && file.SizeBytes <= (32LL << 20), "invalid data file size");
-        auto bytesMemory =
-            ReserveAdmission(ResourceClass::Data, static_cast<uint64_t>(file.SizeBytes) * 2 + (64ULL << 10));
-        FileMemory_ = ReserveAdmission(ResourceClass::Metadata, 256ULL << 20);
-        // Writer limits bound one data file to 32 MiB in this profile.
-        auto bytes = TakeIceberg(Context_.FileIO->ReadFile(file.Path, static_cast<size_t>(file.SizeBytes)),
-            "IO_ERROR",
-            "read data file");
-        ++DataFilesRead_;
-        DataBytesRead_ += static_cast<int64_t>(bytes.size());
-        CheckActive();
-        if (static_cast<int64_t>(bytes.size()) != file.SizeBytes) {
-            Fail("CORRUPTION", "read data file", "file length differs from its manifest");
-        }
+        auto fileMemory = ReserveAdmission(ResourceClass::Metadata, 256ULL << 20);
+        auto source = Take(TScanRandomAccessFile::Open(*Context_.FileIO,
+            file.Path,
+            file.SizeBytes,
+            TScanInputOptions{
+                .Pool = Pool_.get(),
+                .Cancelled = &Cancelled_,
+                .Closing = Context_.Closing,
+                .TotalBytesRead = DataBytesRead_,
+            }));
+        FileMemory_ = std::move(fileMemory);
         // The same strict footer check as recovery: field IDs, names,
         // repetition, physical/logical types and row counts per row group.
-        TBufferInputFile buffered({.Location = file.Path, .Bytes = bytes});
-        (void)TakeIceberg(NGlamDB::NStorage::CheckParquet(buffered, *FileSchema_, {file.SizeBytes, file.RecordCount}),
-            "CORRUPTION",
-            "verify Parquet file");
-        DecodeParquet("open Parquet file", [&] {
-            auto buffer = std::make_shared<TLeaseBuffer>(arrow::Buffer::FromString(std::move(bytes)), bytesMemory);
-            auto source = std::make_shared<arrow::io::BufferReader>(std::move(buffer));
-            auto reader = TakeArrow(parquet::arrow::OpenFile(source, Pool_.get()), "CORRUPTION", "open Parquet file");
-            reader->set_batch_size(BatchRows_);
-            std::vector<int> rowGroups(static_cast<size_t>(reader->num_row_groups()));
-            std::iota(rowGroups.begin(), rowGroups.end(), 0);
+        std::shared_ptr<parquet::FileMetaData> verifiedFooter;
+        if (Context_.Cache) {
+            verifiedFooter = Context_.Cache->FindFooter(file.Path, file.SizeBytes, file.RecordCount);
+        }
+        if (!verifiedFooter) {
+            verifiedFooter = Take(source->ReadFooter(*FileSchema_, {file.SizeBytes, file.RecordCount}));
+            if (Context_.Cache) {
+                Context_.Cache->PutFooter(file.Path, file.SizeBytes, file.RecordCount, verifiedFooter);
+            }
+        }
+        ++DataFilesRead_;
+        CheckActive();
+        const int numRowGroups = verifiedFooter->num_row_groups();
+        std::vector<int> rowGroups;
+        rowGroups.reserve(static_cast<size_t>(std::max(0, numRowGroups)));
+        for (int ordinal = 0; ordinal < numRowGroups; ++ordinal) {
+            std::unique_ptr<parquet::RowGroupMetaData> group;
+            DecodeParquetWithSource(source, "inspect Parquet row group", [&] {
+                group = verifiedFooter->RowGroup(ordinal);
+            });
+            const auto groupRows = group->num_rows();
+            const auto groupStats = Take(ExtractRowGroupZoneStats(*group, Context_.Collection.schema, ReadFields_));
+            if (groupRows == 0) {
+                continue;
+            }
+            if (Context_.EnableRowGroupPruning && Take(CanPruneZone(Predicate_, groupRows, ReadFields_, groupStats))) {
+                ++RowGroupsPruned_;
+                continue;
+            }
+            rowGroups.push_back(ordinal);
+        }
+        CheckActive();
+        if (rowGroups.empty()) {
+            auto closed = source->CloseStream();
+            if (!closed) {
+                throw Failure(std::move(closed.error()));
+            }
+            CheckActive();
+            FileMemory_.reset();
+            return;
+        }
+        DecodeParquetWithSource(source, "open Parquet file", [&] {
+            const NGlamDB::NStorage::TParquetLimits parquetLimits{};
+            parquet::ReaderProperties readerProps(Pool_.get());
+            readerProps.set_thrift_string_size_limit(static_cast<int32_t>(parquetLimits.MaxFooterBytes));
+            readerProps.set_thrift_container_size_limit(parquetLimits.MaxThriftContainerElements);
+            auto parquetReader = parquet::ParquetFileReader::Open(source, readerProps, std::move(verifiedFooter));
+            parquet::ArrowReaderProperties arrowProps(/*use_threads=*/false);
+            arrowProps.set_pre_buffer(false);
+            arrowProps.set_batch_size(BatchRows_);
+            arrowProps.set_io_context(arrow::io::IOContext(Pool_.get()));
+            auto reader = TakeArrow(parquet::arrow::FileReader::Make(Pool_.get(), std::move(parquetReader), arrowProps),
+                "CORRUPTION",
+                "open Parquet file");
             std::vector<int> columns;
             columns.reserve(ReadFields_.size());
             for (const auto field : ReadFields_) {
@@ -575,6 +679,7 @@ private:
             }
             BatchReader_ =
                 TakeArrow(reader->GetRecordBatchReader(rowGroups, columns), "CORRUPTION", "open Parquet batches");
+            FileSource_ = std::move(source);
             FileReader_ = std::move(reader);
         });
     }
@@ -698,9 +803,9 @@ Result<std::shared_ptr<ScanCursor>> OpenScan(TScanContext context, const ScanReq
                 BoundedDiagnostic("collection schema profile: " + profile.error().message),
                 RetryHint::OperatorAction});
         }
-        auto plan =
-            Take(context.VerifiedState ? PlanVerifiedScan(*context.VerifiedState, context.Base, request.selector)
-                                       : PlanManifests(context.FileIO, context.Base, request.selector));
+        auto plan = Take(context.VerifiedState
+                ? PlanVerifiedScan(*context.VerifiedState, context.Base, request.selector)
+                : PlanManifests(context.FileIO, context.Base, request.selector, context.Cache.get()));
         // Uncached lists/schemas remain materialized in the plan. Verified
         // membership already retains the backend's shared generation lease.
         auto retainedPlan = context.VerifiedState ? nullptr : planningMemory;

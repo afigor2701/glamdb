@@ -27,7 +27,7 @@ and network CLI. Independent durable I/O and Arrow/Parquet/Iceberg
 storage primitives provide file production, staging, publication validation,
 recovery verification, and capacity checks. `core/backend/` connects them to the
 coordinator StorageBackend and `core/scan/` implements `Engine::Scan`
-(fixed snapshot, verified membership index, SQL three-valued compound predicates `True`/`Compare`/`In`/`IsNull`/`IsNotNull`/`And`/`Or`/`Not`, projection including zero columns, limit; no pruning). See
+(fixed snapshot, verified membership index, SQL three-valued compound predicates `True`/`Compare`/`In`/`IsNull`/`IsNotNull`/`And`/`Or`/`Not`, projection including zero columns, limit, positional Parquet column/row-group reads, conservative manifest file and Parquet row-group pruning, and a bounded immutable metadata/footer cache; page and Bloom pruning remain unimplemented). See
 [the scanner guide](docs/development/SCANNER.md) for their contract and
 validation status, [the coordinator guide](docs/development/COORDINATOR.md)
 for the integration contract, and [the storage guide](docs/development/STORAGE_MODULE.md)
@@ -35,8 +35,9 @@ for the file-layer contract. A shared `ResourceOwner` now admits engines,
 transport copies and tracked Arrow allocations under finite class and device
 reservations; see [the resource owner](docs/development/SHARED_RESOURCES.md)
 for conservative envelopes, retained-buffer lifetime and measured validation.
-Scan plans, queued manifest descriptors and individual output descriptors retain
-shared reservations; cursor control admission and live/peak memory profiles are
+Scan plans, queued manifest descriptors, individual output descriptors and the
+per-store 32 MiB immutable metadata/footer cache retain shared reservations;
+cursor control admission and live/peak memory profiles are
 described in [shared resources](docs/development/SHARED_RESOURCES.md).
 Full engine durability remains unqualified. `Engine::GetHealth()` exposes
 nonblocking read/write admission and recovery/shutdown state; HTTP
@@ -241,7 +242,7 @@ Preserve these boundaries when adding or changing engine behavior:
 | `public/storage/` | Installed C++ types, scan API and synchronous engine facade. |
 | `core/api/`, `core/catalog/`, `core/engine/` | Canonical input, catalog, coordinator, and internal storage-backend seam. |
 | `core/backend/` | Production StorageBackend over `glamdb_storage`, built with `GLAMDB_BUILD_STORAGE`. |
-| `core/scan/` | Predicate evaluation, snapshot planning and Parquet scan cursor. |
+| `core/scan/` | Predicate evaluation, conservative zone pruning, snapshot planning, bounded metadata/footer cache and positional Parquet scan cursor. |
 | `core/telemetry/` | Private typed event adapter over pinned Quill; bounded frontend/backend memory and stderr process counters. |
 | `deploy/logging/`, `tools/logging/` | Pinned Loki/Alloy/private Grafana deployment, native macOS/Podman collection, control-plane adapter and real ingestion/redaction checks. |
 | `core/io/` | Independent local filesystem, attempts, receipts, durable files and copying (`glamdb_io`). |

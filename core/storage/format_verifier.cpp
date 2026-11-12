@@ -113,51 +113,53 @@ iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ParseFooter(std::span<co
     parquet::ReaderProperties properties;
     properties.set_thrift_string_size_limit(static_cast<std::int32_t>(bytes.size()));
     properties.set_thrift_container_size_limit(limits.MaxThriftContainerElements);
-    std::shared_ptr<parquet::FileMetaData> metadata;
     try {
-        metadata = parquet::FileMetaData::Make(bytes.data(), &parsedLength, properties);
+        const auto metadata = parquet::FileMetaData::Make(bytes.data(), &parsedLength, properties);
+        if (metadata->is_encryption_algorithm_set()) {
+            return iceberg::Invalid("CORRUPTION: Encrypted Parquet files are not supported.");
+        }
+        const auto fields = schema.fields();
+        if (parsedLength != bytes.size() || metadata->num_rows() != expectedRows ||
+            metadata->num_columns() != static_cast<int>(fields.size()) ||
+            metadata->schema()->group_node()->field_count() != static_cast<int>(fields.size()))
+        {
+            return iceberg::Invalid("CORRUPTION: Parquet footer does not match the "
+                                    "expected rows or schema.");
+        }
+        for (std::size_t index = 0; index < fields.size(); ++index) {
+            const auto& node = metadata->schema()->group_node()->field(static_cast<int>(index));
+            if (node->is_repeated() || !MatchesType(*node, *fields[index].type()) ||
+                node->field_id() != fields[index].field_id() || node->name() != fields[index].name() ||
+                node->is_optional() != fields[index].optional())
+            {
+                return iceberg::Invalid("CORRUPTION: Parquet field does not match its schema.");
+            }
+        }
+        std::int64_t rowCount = 0;
+        for (int index = 0; index < metadata->num_row_groups(); ++index) {
+            const auto group = metadata->RowGroup(index);
+            const auto rows = group->num_rows();
+            if (rows < 0 || rows > expectedRows - rowCount || group->num_columns() != metadata->num_columns()) {
+                return iceberg::Invalid("CORRUPTION: Invalid Parquet row group count.");
+            }
+            for (int column = 0; column < group->num_columns(); ++column) {
+                const auto chunk = group->ColumnChunk(column);
+                const auto* descriptor = metadata->schema()->Column(column);
+                if (chunk->type() != descriptor->physical_type() ||
+                    chunk->path_in_schema()->ToDotVector() != descriptor->path()->ToDotVector())
+                {
+                    return iceberg::Invalid("CORRUPTION: Parquet column chunk does not match its schema.");
+                }
+            }
+            rowCount += rows;
+        }
+        if (rowCount != expectedRows) {
+            return iceberg::Invalid("CORRUPTION: Parquet row groups do not match the total row count.");
+        }
+        return metadata;
     } catch (const parquet::ParquetException& error) {
         return iceberg::Invalid("CORRUPTION: Invalid Parquet footer: {}", error.what());
     }
-    const auto fields = schema.fields();
-    if (parsedLength != bytes.size() || metadata->num_rows() != expectedRows ||
-        metadata->num_columns() != static_cast<int>(fields.size()) ||
-        metadata->schema()->group_node()->field_count() != static_cast<int>(fields.size()))
-    {
-        return iceberg::Invalid("CORRUPTION: Parquet footer does not match the "
-                                "expected rows or schema.");
-    }
-    for (std::size_t index = 0; index < fields.size(); ++index) {
-        const auto& node = metadata->schema()->group_node()->field(static_cast<int>(index));
-        if (node->is_repeated() || !MatchesType(*node, *fields[index].type()) ||
-            node->field_id() != fields[index].field_id() || node->name() != fields[index].name() ||
-            node->is_optional() != fields[index].optional())
-        {
-            return iceberg::Invalid("CORRUPTION: Parquet field does not match its schema.");
-        }
-    }
-    std::int64_t rowCount = 0;
-    for (int index = 0; index < metadata->num_row_groups(); ++index) {
-        const auto group = metadata->RowGroup(index);
-        const auto rows = group->num_rows();
-        if (rows < 0 || rows > expectedRows - rowCount || group->num_columns() != metadata->num_columns()) {
-            return iceberg::Invalid("CORRUPTION: Invalid Parquet row group count.");
-        }
-        for (int column = 0; column < group->num_columns(); ++column) {
-            const auto chunk = group->ColumnChunk(column);
-            const auto* descriptor = metadata->schema()->Column(column);
-            if (chunk->type() != descriptor->physical_type() ||
-                chunk->path_in_schema()->ToDotVector() != descriptor->path()->ToDotVector())
-            {
-                return iceberg::Invalid("CORRUPTION: Parquet column chunk does not match its schema.");
-            }
-        }
-        rowCount += rows;
-    }
-    if (rowCount != expectedRows) {
-        return iceberg::Invalid("CORRUPTION: Parquet row groups do not match the total row count.");
-    }
-    return metadata;
 }
 
 class TAvroCursor
@@ -401,6 +403,62 @@ iceberg::Result<TParquetFileInfo> CheckParquet(iceberg::InputFile& file,
     return TParquetFileInfo{metadata->size(), metadata->num_rows(), metadata->num_row_groups()};
 }
 
+iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ReadParquetFooterFromStream(
+    iceberg::SeekableInputStream& stream,
+    std::int64_t actualSize,
+    const iceberg::Schema& schema,
+    TParquetExpectation expected,
+    TParquetLimits limits,
+    std::uint64_t* bytesReadOut)
+{
+    const auto expectedLength = expected.Length;
+    const auto expectedRows = expected.RowCount;
+    return CatchIcebergExceptions([&]() -> iceberg::Result<std::shared_ptr<parquet::FileMetaData>> {
+        if (expectedRows < 0 || limits.MaxFooterBytes > std::numeric_limits<std::int32_t>::max() ||
+            limits.MaxThriftContainerElements <= 0)
+        {
+            return iceberg::InvalidArgument("Invalid Parquet verification limits.");
+        }
+        if (limits.MaxFileBytes < 0 || expectedLength < 0) {
+            return iceberg::InvalidArgument("File size limits must be nonnegative.");
+        }
+        if (actualSize < 0 || actualSize != expectedLength) {
+            return iceberg::Invalid("CORRUPTION: File length differs from its expected length.");
+        }
+        if (actualSize > limits.MaxFileBytes) {
+            return iceberg::InvalidArgument("File exceeds its byte limit.");
+        }
+        if (actualSize < 12) {
+            return iceberg::Invalid("CORRUPTION: Parquet file is truncated.");
+        }
+        std::array<std::byte, 4> header;
+        std::array<std::byte, 8> trailer;
+        ICEBERG_RETURN_UNEXPECTED(stream.ReadFully(0, header));
+        ICEBERG_RETURN_UNEXPECTED(stream.ReadFully(actualSize - 8, trailer));
+        const auto magic = std::as_bytes(std::span("PAR1", 4));
+        if (!std::ranges::equal(header, magic) || !std::ranges::equal(std::span(trailer).subspan(4), magic)) {
+            return iceberg::Invalid("CORRUPTION: Invalid Parquet magic.");
+        }
+        std::uint32_t footerLength = 0;
+        for (unsigned index = 0; index < 4; ++index) {
+            footerLength |= std::to_integer<std::uint32_t>(trailer[index]) << (index * 8);
+        }
+        if (footerLength == 0 || footerLength > static_cast<std::uint64_t>(actualSize - 12)) {
+            return iceberg::Invalid("CORRUPTION: Invalid Parquet footer length.");
+        }
+        if (footerLength > limits.MaxFooterBytes) {
+            return iceberg::InvalidArgument("Parquet footer exceeds its byte limit.");
+        }
+        std::vector<std::byte> footer(footerLength);
+        ICEBERG_RETURN_UNEXPECTED(stream.ReadFully(actualSize - 8 - footerLength, footer));
+        auto parsed = ParseFooter(footer, expectedRows, schema, limits);
+        if (parsed && bytesReadOut != nullptr) {
+            *bytesReadOut += header.size() + trailer.size() + footer.size();
+        }
+        return parsed;
+    });
+}
+
 iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ReadParquetFooter(iceberg::InputFile& file,
     const iceberg::Schema& schema,
     TParquetExpectation expected,
@@ -418,30 +476,9 @@ iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ReadParquetFooter(iceber
         if (size < 12) {
             return iceberg::Invalid("CORRUPTION: Parquet file is truncated.");
         }
-        return WithStream<std::shared_ptr<parquet::FileMetaData>>(file,
-            [&](iceberg::SeekableInputStream& stream) -> iceberg::Result<std::shared_ptr<parquet::FileMetaData>> {
-                std::array<std::byte, 4> header;
-                std::array<std::byte, 8> trailer;
-                ICEBERG_RETURN_UNEXPECTED(stream.ReadFully(0, header));
-                ICEBERG_RETURN_UNEXPECTED(stream.ReadFully(size - 8, trailer));
-                const auto magic = std::as_bytes(std::span("PAR1", 4));
-                if (!std::ranges::equal(header, magic) || !std::ranges::equal(std::span(trailer).subspan(4), magic)) {
-                    return iceberg::Invalid("CORRUPTION: Invalid Parquet magic.");
-                }
-                std::uint32_t footerLength = 0;
-                for (unsigned index = 0; index < 4; ++index) {
-                    footerLength |= std::to_integer<std::uint32_t>(trailer[index]) << (index * 8);
-                }
-                if (footerLength == 0 || footerLength > static_cast<std::uint64_t>(size - 12)) {
-                    return iceberg::Invalid("CORRUPTION: Invalid Parquet footer length.");
-                }
-                if (footerLength > limits.MaxFooterBytes) {
-                    return iceberg::InvalidArgument("Parquet footer exceeds its byte limit.");
-                }
-                std::vector<std::byte> footer(footerLength);
-                ICEBERG_RETURN_UNEXPECTED(stream.ReadFully(size - 8 - footerLength, footer));
-                return ParseFooter(footer, expectedRows, schema, limits);
-            });
+        return WithStream<std::shared_ptr<parquet::FileMetaData>>(file, [&](iceberg::SeekableInputStream& stream) {
+            return ReadParquetFooterFromStream(stream, size, schema, expected, limits);
+        });
     });
 }
 
@@ -505,6 +542,34 @@ iceberg::Result<std::unique_ptr<iceberg::TableMetadata>> ReadTableMetadata(icebe
     });
 }
 
+iceberg::Result<std::unique_ptr<iceberg::TableMetadata>> ReadTableMetadataFromInput(iceberg::InputFile& file,
+    const std::string& path,
+    std::int64_t actualSize,
+    std::int64_t maxBytes)
+{
+    return CatchIcebergExceptions([&]() -> iceberg::Result<std::unique_ptr<iceberg::TableMetadata>> {
+        if (!path.ends_with(".metadata.json")) {
+            return iceberg::InvalidArgument("Metadata verification requires an uncompressed JSON file.");
+        }
+        if (maxBytes < 0) {
+            return iceberg::InvalidArgument("File size limits must be nonnegative.");
+        }
+        if (actualSize < 0) {
+            return iceberg::Invalid("CORRUPTION: File length differs from its expected length.");
+        }
+        if (actualSize > maxBytes) {
+            return iceberg::InvalidArgument("File exceeds its byte limit.");
+        }
+        ICEBERG_ASSIGN_OR_RAISE(auto bytes,
+            WithStream<std::string>(file, [&](iceberg::SeekableInputStream& stream) -> iceberg::Result<std::string> {
+                std::string buffer(static_cast<std::size_t>(actualSize), '\0');
+                ICEBERG_RETURN_UNEXPECTED(stream.ReadFully(0, std::as_writable_bytes(std::span(buffer))));
+                return buffer;
+            }));
+        return ParseBoundedMetadata(std::move(bytes), path);
+    });
+}
+
 iceberg::Result<std::string> SerializeTableMetadata(const iceberg::TableMetadata& metadata)
 {
     return CatchIcebergExceptions([&]() -> iceberg::Result<std::string> {
@@ -546,5 +611,4 @@ std::uint64_t TableMetadataParses() noexcept
 {
     return MetadataParses.load(std::memory_order_relaxed);
 }
-
 }

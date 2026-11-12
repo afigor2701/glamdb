@@ -1975,10 +1975,10 @@
           "type": "object",
           "properties": {
             "file_pruning": {
-              "const": false
+              "type": "boolean"
             },
             "row_group_pruning": {
-              "const": false
+              "type": "boolean"
             },
             "page_pruning": {
               "const": false

@@ -247,14 +247,17 @@ TEST_F(ScanSessionsTest, DuplicateExecutingPageRefusesBeforeAcquiringWorkMemory)
 }
 TEST_F(ScanSessionsTest, ServiceShutdownCancelsSlowReadsWithoutWaiting)
 {
-    ASSERT_EQ(Db->AppendDurable({test::collection_id, SecondOperation, {}, {Batch({{"other", 2, 2.5, false, 1}})}})
+    ASSERT_EQ(Db->AppendDurable({test::collection_id,
+                                    SecondOperation,
+                                    {},
+                                    {Batch({{"alpha", 2, 2.5, false, 1}, {"zeta", 3, 3.5, false, 2}})}})
                   .disposition,
         CommitDisposition::Committed);
     TRoutes routes(Db, {}, "secret");
     TRequest request{"POST",
         std::string("/collections/") + test::collection_id + "/scan/open",
         {{"authorization", "Bearer secret"}, {"content-type", "application/json"}},
-        R"({"predicate":{"op":"eq","field":"key","value":"absent"}})"};
+        R"({"predicate":{"op":"eq","field":"key","value":"same"}})"};
     const auto opened = routes.Handle(request);
     ASSERT_EQ(opened.Status, 200);
     const auto token = TJson::parse(opened.Body).at("cursor");

@@ -1,3 +1,4 @@
+#include "apps/server/databases.h"
 #include "apps/server/metadata.h"
 #include "apps/server/routes.h"
 #include "core/engine/engine_factory.h"
@@ -51,6 +52,32 @@ TEST(NativeRoutes, CapabilitiesListParquetCodecsOfTheBuild)
     // Installed inventory of a storage build advertises the same codecs.
     const auto installed = InstalledCapabilities();
     EXPECT_EQ(installed.write_settings, installed.backend == BackendKind::LocalStorage);
+}
+
+TEST(NativeRoutes, InstalledCapabilitiesMatchProductionStorageBuild)
+{
+    test::TempDir temporary;
+    const auto created =
+        CreateStore({.store_id = test::store_id, .absolute_root = (temporary.path / "store").string()});
+    const auto expected = created ? (*created)->GetCapabilities() : EngineCapabilities{};
+    const auto installed = InstalledCapabilities();
+    EXPECT_EQ(installed.backend, expected.backend);
+    EXPECT_EQ(installed.append, expected.append);
+    EXPECT_EQ(installed.scan, expected.scan);
+    EXPECT_EQ(installed.metadata, expected.metadata);
+    EXPECT_EQ(installed.durability_qualified, expected.durability_qualified);
+    EXPECT_EQ(installed.file_pruning, expected.file_pruning);
+    EXPECT_EQ(installed.row_group_pruning, expected.row_group_pruning);
+
+    auto databases = std::make_shared<TDatabases>(temporary.path / "data");
+    TRoutes routes(databases, {}, "secret");
+    const auto response = routes.Handle({"GET", "/capabilities", {{"authorization", "Bearer secret"}}, {}});
+    ASSERT_EQ(response.Status, 200);
+    const auto value = NTransport::ParseJson(response.Body);
+    EXPECT_EQ(value["file_pruning"], expected.file_pruning);
+    EXPECT_EQ(value["row_group_pruning"], expected.row_group_pruning);
+    EXPECT_FALSE(value["durability_qualified"].get<bool>());
+    databases->Shutdown();
 }
 
 TEST(NativeRoutes, OutcomeLookupRetainsUnknownRecoveryContext)

@@ -303,8 +303,9 @@ TJson FileJson(const Engine& engine,
         {"column", columnIndex},
         {"offset", offsetIndex},
         {"bloom", nullptr}};
-    value["execution_capabilities"] = {{"file_pruning", false},
-        {"row_group_pruning", false},
+    const auto capabilities = engine.GetCapabilities();
+    value["execution_capabilities"] = {{"file_pruning", capabilities.file_pruning},
+        {"row_group_pruning", capabilities.row_group_pruning},
         {"page_pruning", false},
         {"bloom_pruning", false}};
     return value;

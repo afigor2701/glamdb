@@ -90,6 +90,8 @@ EngineCapabilities InstalledCapabilities()
         .append = true,
         .scan = true,
         .metadata = true,
+        .file_pruning = true,
+        .row_group_pruning = true,
         .write_settings = true,
         .parquet_codecs = detail::ParquetCodecCapabilities()};
 #else
@@ -203,18 +205,23 @@ TJson ExplainJson(const Engine& engine, const std::string& collection, const TJs
     }
     auto capabilities =
         CapabilitiesJson(engine.GetCapabilities(), engine.GetHealth(), false, engine.GetStoreInfo().store_id, scans);
+    capabilities["file_pruning"] = explanation.file_pruning;
+    capabilities["row_group_pruning"] = explanation.row_group_pruning;
+    TJson plan = TJson::array({"resolve confirmed fixed view"});
+    if (explanation.file_pruning || explanation.row_group_pruning) {
+        plan.push_back("prune candidate files and Parquet row groups");
+    }
+    plan.push_back("read committed candidate files");
+    plan.push_back("exact SQL three-valued filter");
+    plan.push_back("projection");
+    plan.push_back("limit");
     value.update({{"schema", schema},
         {"read_columns", explanation.read_fields},
         {"output_columns", output},
         {"predicate", PredicateJson(explanation.predicate)},
         {"limit", OptionalInteger(explanation.limit)},
         {"batch_rows", std::to_string(explanation.batch_rows)},
-        {"plan",
-            {"resolve confirmed fixed view",
-                "read committed candidate files",
-                "exact SQL three-valued filter",
-                "projection",
-                "limit"}},
+        {"plan", std::move(plan)},
         {"candidates", Statistics(explanation.candidates)},
         {"estimates",
             {{"rows_before_filter", Value(explanation.candidates.rows)},

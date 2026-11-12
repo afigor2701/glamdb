@@ -16,6 +16,8 @@ struct TBaseState;
 
 namespace glamdb::detail {
 
+class TSnapshotMetadataCache;
+
 struct CollectionView
 {
     CollectionInfo info;
@@ -116,6 +118,10 @@ public:
     // No I/O. Only an exact, explicitly confirmed root of the current verified
     // generation may be pinned; tentative candidates are never returned.
     virtual Result<std::shared_ptr<const NGlamDB::NStorage::TBaseState>> VerifiedScanState(const BaseIdentity&)
+    {
+        return nullptr;
+    }
+    virtual std::shared_ptr<TSnapshotMetadataCache> ReadMetadataCache()
     {
         return nullptr;
     }

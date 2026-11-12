@@ -216,8 +216,8 @@
           "offset": false
         },
         "execution_capabilities": {
-          "file_pruning": false,
-          "row_group_pruning": false,
+          "file_pruning": true,
+          "row_group_pruning": true,
           "page_pruning": false,
           "bloom_pruning": false
         },

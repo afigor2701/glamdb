@@ -190,7 +190,7 @@ separate, broader development profile.
 | `GET .../snapshots` | `ListSnapshots` | Receipt-backed history, bounded fixed-view pages |
 | `GET .../files` | `ListFiles` | Manifest membership and opaque file IDs, bounded pages |
 | `GET .../files/{file}` | `GetFileDetails` | Selected-view membership plus actual Parquet footer/row groups |
-| `POST .../explain` | `ExplainScan` | Fixed-view plan, unsupported pruning remains false |
+| `POST .../explain` | `ExplainScan` | Fixed-view plan; advertises file/row-group pruning on local storage while page/Bloom pruning remains false |
 
 CLI mapping: `create-store` → `POST /databases`; `request` exposes every route
 in the tables above. Offline `glamdb-admin` uses `CreateStore` / `OpenExisting`.
@@ -219,7 +219,8 @@ The readiness body contains `state`, `read_available`, `write_ready`,
 `storage_failure_latched`, `durability_qualified`, and the existing `backend`,
 `mock`, `durability_validation` identity fields. The same object appears as
 `health` in scoped `/databases/{id}/capabilities` and legacy `/capabilities`.
-Managed root `/capabilities` has `health: null`; it advertises installed features,
+Managed root `/capabilities` has `health: null`; it advertises installed features
+(including `file_pruning` and `row_group_pruning` when built with local storage),
 not current store admission. Scoped capabilities return 200 even when the store
 is unavailable, so clients can inspect health without attempting a write.
 

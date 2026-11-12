@@ -51,7 +51,8 @@ if(NOT GLAMDB_IO_ONLY)
         # factories install no backend and report DEPENDENCY_UNAVAILABLE.
         target_sources(glamdb_core PRIVATE backend/inert_catalog.cpp backend/local_storage_backend.cpp
             backend/storage_errors.cpp
-            scan/scan_planner.cpp scan/scan_cursor.cpp scan/metadata.cpp scan/file_metadata.cpp)
+            scan/parquet_input.cpp scan/pruning.cpp scan/metadata_cache.cpp scan/scan_planner.cpp scan/scan_cursor.cpp
+            scan/metadata.cpp scan/file_metadata.cpp)
         target_compile_definitions(glamdb_core PRIVATE GLAMDB_HAS_STORAGE=1)
         target_link_libraries(glamdb_core PRIVATE glamdb_storage)
         set_target_properties(glamdb_io PROPERTIES EXPORT_NAME io)

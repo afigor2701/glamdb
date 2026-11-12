@@ -168,7 +168,7 @@ iceberg::Result<TStorageUsage> CheckManifest(const std::shared_ptr<iceberg::File
     ICEBERG_RETURN_UNEXPECTED(MarkVerified(attempt, manifest.manifest_path));
     if (scanIndex) {
         const auto& file = *entry.data_file;
-        scanIndex->Files.push_back({file.file_path, file.file_size_in_bytes, file.record_count});
+        scanIndex->Files.push_back({file.file_path, file.file_size_in_bytes, file.record_count, entry.data_file});
     }
     TStorageUsage delta;
     delta.DataFiles = 1;

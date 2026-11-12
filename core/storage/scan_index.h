@@ -2,8 +2,13 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
+
+namespace iceberg {
+struct DataFile;
+}
 
 namespace NGlamDB::NStorage {
 
@@ -12,8 +17,12 @@ struct TScanDataFile
     std::string Path;
     std::int64_t SizeBytes = 0;
     std::int64_t RecordCount = 0;
+    std::shared_ptr<const iceberg::DataFile> DataFile{};
 
-    bool operator==(const TScanDataFile&) const = default;
+    bool operator==(const TScanDataFile& other) const
+    {
+        return Path == other.Path && SizeBytes == other.SizeBytes && RecordCount == other.RecordCount;
+    }
 };
 
 struct TSnapshotBoundary

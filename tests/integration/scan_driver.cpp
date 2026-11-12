@@ -189,6 +189,10 @@ public:
     {
         return Inner_->ReadOnlyFileIO();
     }
+    std::shared_ptr<detail::TSnapshotMetadataCache> ReadMetadataCache() override
+    {
+        return Inner_->ReadMetadataCache();
+    }
 
 private:
     std::shared_ptr<detail::StorageBackend> Inner_;

@@ -24,13 +24,14 @@ protected:
     // fault FS alive until the engine is released in TearDown.
     NGlamDB::NIO::TPosixLocalFS Posix_;
     std::shared_ptr<TFaultFS> Faults_ = std::make_shared<TFaultFS>(Posix_);
+    std::shared_ptr<detail::TLocalStorageBackend> Backend_;
     std::shared_ptr<Engine> Engine_;
 
     void SetUp() override
     {
         const auto faults = Faults_;
         const detail::BackendFactory factory =
-            [faults](const std::filesystem::path& path,
+            [this, faults](const std::filesystem::path& path,
                 const StoreInfo& info) -> Result<std::shared_ptr<detail::StorageBackend>> {
             detail::TLocalStorageOptions options;
             options.Fs = faults;
@@ -38,6 +39,7 @@ protected:
             if (!backend) {
                 return std::unexpected(backend.error());
             }
+            Backend_ = *backend;
             return std::shared_ptr<detail::StorageBackend>(std::move(*backend));
         };
         auto created = detail::EngineFactory::CreateWith({test::store_id, Root_.string()}, factory);
@@ -56,6 +58,7 @@ protected:
             EXPECT_TRUE(Engine_->Shutdown(1000ms));
             Engine_.reset();
         }
+        Backend_.reset();
     }
 
     int64_t CountRows()
@@ -199,6 +202,84 @@ TEST_F(ScanReadErrorClassificationTest, MissingSelectedDataFileClosesReadiness)
     EXPECT_EQ(failed.error().code, "CORRUPTION");
     EXPECT_FALSE(Engine_->GetHealth().read_available);
     ASSERT_TRUE(Engine_->Reconcile());
+}
+
+TEST_F(ScanReadErrorClassificationTest, PositionalParquetScanReadsNeededRangesAndPreservesTransientErrors)
+{
+    const auto listing = Engine_->ListFiles(test::collection_id);
+    ASSERT_TRUE(listing);
+    ASSERT_EQ(listing->Files.size(), 1U);
+    const auto fileSize = static_cast<uint64_t>(listing->Files.front().CompressedBytes);
+
+    const auto startEvent = Faults_->Events().size();
+    const auto projected =
+        Engine_->Scan({.collection_id = test::collection_id, .projection = std::vector<std::string>{"key"}});
+    ASSERT_TRUE(projected);
+    int64_t rows = 0;
+    while (true) {
+        const auto batch = (*projected)->Next();
+        ASSERT_TRUE(batch) << batch.error().message;
+        if (!*batch) {
+            break;
+        }
+        rows += (*batch)->num_rows();
+    }
+    EXPECT_EQ(rows, static_cast<int64_t>(FirstRows.size()));
+    uint64_t preadBytes = 0;
+    const auto events = Faults_->Events();
+    for (size_t index = startEvent; index < events.size(); ++index) {
+        if (events[index].Op == EIOOp::PRead && events[index].Path.ends_with(".parquet")) {
+            preadBytes += events[index].Bytes;
+        }
+    }
+    EXPECT_GT(preadBytes, 12U);
+    EXPECT_LT(preadBytes, fileSize);
+    EXPECT_EQ((*projected)->Profile().data_bytes_read.value, static_cast<int64_t>(preadBytes));
+
+    // Inject transient PRead failures at the 1st (header), 3rd (footer), and 4th (column page) reads,
+    // plus a transient Close failure after reading all batches. None may be misclassified as CORRUPTION.
+    for (const uint32_t nthRead : {1U, 3U, 4U}) {
+        for (const auto& [err, expected] :
+            {std::pair{std::errc::io_error, "IO_ERROR"}, std::pair{std::errc::not_enough_memory, "RESOURCE_EXHAUSTED"}})
+        {
+            SCOPED_TRACE(std::to_string(nthRead) + ":" + expected);
+            ASSERT_NE(Backend_, nullptr);
+            Backend_->InvalidateCache();
+            Faults_->AddRule({EIOOp::PRead, "*.parquet", nthRead, 1, std::make_error_code(err), std::nullopt});
+            const auto cursor =
+                Engine_->Scan({.collection_id = test::collection_id, .projection = std::vector<std::string>{"key"}});
+            ASSERT_TRUE(cursor);
+            const auto failed = (*cursor)->Next();
+            ASSERT_FALSE(failed);
+            EXPECT_EQ(failed.error().code, expected) << failed.error().message;
+            EXPECT_TRUE(Engine_->GetHealth().read_available);
+            EXPECT_EQ(CountRows(), static_cast<int64_t>(FirstRows.size()));
+        }
+    }
+
+    Faults_->AddRule({EIOOp::Close, "*.parquet", 1, 1, std::make_error_code(std::errc::io_error), std::nullopt});
+    {
+        const auto cursor =
+            Engine_->Scan({.collection_id = test::collection_id, .projection = std::vector<std::string>{"key"}});
+        ASSERT_TRUE(cursor);
+        ErrorDetail error{};
+        bool failed = false;
+        while (true) {
+            const auto batch = (*cursor)->Next();
+            if (!batch) {
+                error = batch.error();
+                failed = true;
+                break;
+            }
+            if (!*batch) {
+                break;
+            }
+        }
+        ASSERT_TRUE(failed) << "expected Close failure to be surfaced by Next()";
+        EXPECT_EQ(error.code, "IO_ERROR") << error.message;
+        EXPECT_TRUE(Engine_->GetHealth().read_available);
+    }
+    EXPECT_EQ(CountRows(), static_cast<int64_t>(FirstRows.size()));
 }
 
 } // namespace

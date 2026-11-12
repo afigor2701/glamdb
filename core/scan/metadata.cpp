@@ -37,12 +37,12 @@ void Add(int64_t& total, int64_t value)
 
 CollectionStatistics ReadStatistics(const TScanContext& context, const SnapshotSelector& selector)
 {
-    const auto plan = Take(PlanManifests(context.FileIO, context.Base, selector));
+    const auto plan = Take(PlanManifests(context.FileIO, context.Base, selector, context.Cache.get()));
     int64_t rows = 0;
     int64_t files = 0;
     int64_t bytes = 0;
     for (size_t index = 0; index < plan.Manifests.size(); ++index) {
-        for (const auto& file : Take(ManifestFiles(context.FileIO, plan, index))) {
+        for (const auto& file : Take(ManifestFiles(context.FileIO, plan, index, context.Cache.get()))) {
             Add(rows, file.RecordCount);
             Add(files, 1);
             Add(bytes, file.SizeBytes);
@@ -58,7 +58,7 @@ CollectionStatistics ReadStatistics(const TScanContext& context, const SnapshotS
 
 SnapshotHistory ReadHistory(const TScanContext& context, std::span<const AppendResult> receipts)
 {
-    const auto root = Take(ReadScanRoot(context.FileIO, context.Base));
+    const auto root = Take(ReadScanRoot(context.FileIO, context.Base, context.Cache.get()));
     std::map<int64_t, const AppendResult*> bySnapshot;
     for (const auto& receipt : receipts) {
         if (receipt.collection_id == context.Collection.collection_id) {
@@ -121,6 +121,8 @@ ScanExplanation ExplainScan(const TScanContext& context, const ScanRequest& requ
     result.predicate = request.predicate;
     result.limit = request.limit;
     result.batch_rows = request.batch_rows;
+    result.file_pruning = context.EnableFilePruning;
+    result.row_group_pruning = context.EnableRowGroupPruning;
     // OpenScan has already validated the tree. Collect field references without
     // compiling another copy of its potentially large literal sets.
     std::vector<std::string_view> referencedFields;

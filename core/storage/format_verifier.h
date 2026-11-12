@@ -12,6 +12,7 @@ namespace iceberg {
 class FileIO;
 class InputFile;
 class Schema;
+class SeekableInputStream;
 struct TableMetadata;
 }
 
@@ -64,6 +65,14 @@ iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ReadParquetFooter(iceber
     TParquetExpectation expected,
     TParquetLimits limits = {});
 
+iceberg::Result<std::shared_ptr<parquet::FileMetaData>> ReadParquetFooterFromStream(
+    iceberg::SeekableInputStream& stream,
+    std::int64_t actualSize,
+    const iceberg::Schema& schema,
+    TParquetExpectation expected,
+    TParquetLimits limits = {},
+    std::uint64_t* bytesReadOut = nullptr);
+
 // Checks OCF framing and bounded decoding; manifest semantics require the full Iceberg reader.
 iceberg::Result<TAvroContainerInfo>
 CheckAvroContainer(iceberg::InputFile& file, std::int64_t expectedLength, TAvroLimits limits = {});
@@ -71,6 +80,11 @@ CheckAvroContainer(iceberg::InputFile& file, std::int64_t expectedLength, TAvroL
 iceberg::Result<std::unique_ptr<iceberg::TableMetadata>> ReadTableMetadata(iceberg::FileIO& io,
     const std::string& path,
     std::optional<std::string_view> expectedBytes = std::nullopt,
+    std::int64_t maxBytes = 16LL << 20);
+
+iceberg::Result<std::unique_ptr<iceberg::TableMetadata>> ReadTableMetadataFromInput(iceberg::InputFile& file,
+    const std::string& path,
+    std::int64_t actualSize,
     std::int64_t maxBytes = 16LL << 20);
 
 // The exact bytes iceberg::TableMetadataUtil::Write writes for `metadata`.
@@ -89,5 +103,4 @@ iceberg::Status VerifyTableMetadataBytes(iceberg::FileIO& io,
 // Number of root JSON parses (ReadTableMetadata and ParseTableMetadata) in
 // this process; cost tests compare it around an operation.
 std::uint64_t TableMetadataParses() noexcept;
-
 }

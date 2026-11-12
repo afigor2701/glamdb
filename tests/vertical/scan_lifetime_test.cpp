@@ -269,7 +269,22 @@ TEST_P(TScanLifetimeTest, StopDuringDataReadDiscardsTheBatch)
 
 TEST_P(TScanLifetimeTest, StopDuringDataReadDiscardsEos)
 {
-    StopDuringRead(".parquet", Predicate::Compare("key", CompareOp::Eq, std::string("absent")));
+    StopDuringRead(".parquet", Predicate::Compare("key", CompareOp::Eq, std::string("middle")));
+}
+
+TEST_P(TScanLifetimeTest, StopIsCheckedBeforePrunedEos)
+{
+    const auto before = Gate_->DataOpens;
+    auto cursor = Engine_->Scan({
+        .collection_id = test::collection_id,
+        .predicate = Predicate::Compare("key", CompareOp::Eq, std::string("absent")),
+    });
+    ASSERT_TRUE(cursor) << cursor.error().message;
+    Stop(*cursor);
+    const auto next = (*cursor)->Next();
+    ASSERT_FALSE(next);
+    EXPECT_EQ(next.error().code, "CANCELLED");
+    EXPECT_EQ(Gate_->DataOpens, before);
 }
 
 TEST_P(TScanLifetimeTest, StopBeforeIndexedReadDoesNotOpenData)

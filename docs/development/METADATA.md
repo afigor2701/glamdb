@@ -7,7 +7,7 @@ disabled builds return `DEPENDENCY_UNAVAILABLE`.
 
 | API | Result |
 | --- | --- |
-| `GetCapabilities()` | Backend identity and supported append, scan and metadata operations; no I/O or writer wait. Custom backends identify themselves explicitly. |
+| `GetCapabilities()` | Backend identity and supported append, scan, metadata, file-pruning and row-group-pruning operations; no I/O or writer wait. Custom backends identify themselves explicitly. |
 | `GetHealth()` | Current admission/recovery/shutdown state, separate from supported operations. |
 | `ListSnapshots(collection)` | Retained snapshots, oldest first, joined with their original committed append receipts. Initial empty is not a snapshot. |
 | `GetStatistics(collection, selector)` | Rows, live data-file count and compressed data-file bytes from the selected view's manifests. |
@@ -16,15 +16,19 @@ disabled builds return `DEPENDENCY_UNAVAILABLE`.
 | `ListSnapshotsPage(collection, request)` | Pages of one retained append ancestry, oldest first. |
 | `ListFilesPage(collection, request, selector)` | File-ID-ordered pages of one resolved view. |
 | `GetFileDetails(collection, file_id, selector)` | Manifest descriptor and verified physical Parquet row-group/column metadata for a member of the selected view. |
-| `ExplainScan(request)` | Validated projection, physical read fields, predicate, batch size, limit, resolved view and candidate statistics. No Parquet reads. |
+| `ExplainScan(request)` | Validated projection, physical read fields, predicate, batch size, limit, pruning capabilities, resolved view and pre-execution candidate statistics. No Parquet reads. |
 | `ScanCursor::Profile()` | Thread-safe cumulative completed work, available after completion, cancellation and errors. |
 
 Each metadata call admits a read against one confirmed root and holds that
 root through planning, including concurrent appends. No SQLite read transaction
 is held while reading files. History reads durable receipts through the engine's
 catalog interface; receipts for concurrent, newer snapshots are excluded.
-Missing or inconsistent committed metadata reports `CORRUPTION` and closes
+missing or inconsistent committed metadata reports `CORRUPTION` and closes
 readiness. Environmental read errors retain their scan error classification.
+`GetStatistics`, `ListFiles` and `ExplainScan` share the backend's bounded
+immutable `TSnapshotMetadataCache` (roots, manifest lists and live manifest
+`DataFile` vectors); `ListSnapshots` and `GetFileDetails` bypass that cache and
+read authoritative files directly on each call.
 
 `identity` describes the confirmed current root; `selector_resolved` identifies
 the chosen historical or initial view separately. Latest resolves exactly once
@@ -118,15 +122,21 @@ Every `Metric` contains an optional integer and a `MetricKind`:
 - `Unavailable`: null. Logical/uncompressed size, elapsed time and nontrivial
   predicate selectivity remain unavailable; unknown does not mean zero.
 
-Explain lists all candidate files before execution. File and row-group pruning
-are unsupported and explicitly false. A small limit may stop execution early;
-this is not pruning. Projection includes predicate fields in physical reads.
-The scanner reads entire Parquet files, then decodes only requested columns.
+Explain lists snapshot candidate files before execution without opening Parquet
+files; `file_pruning` and `row_group_pruning` reflect the backend's conservative
+zone-pruning capabilities (`true` on `TLocalStorageBackend` by default, `false`
+on custom backends; page and Bloom pruning remain unsupported and false). A small
+limit may stop execution early; this is not pruning. Projection includes
+predicate fields in physical reads. During execution, positional Parquet reads
+fetch only the header/footer (on a footer cache miss) and the column chunks of
+surviving row groups for `projection ∪ predicate` (zero-column unfiltered scans
+read no column chunks).
 
-Profile counters count successfully decoded manifests, successful whole-file
-reads and their bytes, decoded rows before filtering/limit, and rows returned
-after filtering/limit. Bytes include footers and unprojected column bytes but
-exclude metadata, failed/partial reads and device/cache I/O. `Complete` means
+Profile counters count successfully decoded manifests, opened Parquet files that
+yielded at least one surviving row group (`data_files_read`), actual positional
+Parquet `pread` bytes (`data_bytes_read`, excluding cached footers, metadata,
+failed reads after the failing syscall and OS page-cache hits), decoded rows
+before filtering/limit, and rows returned after filtering/limit. `Complete` means
 the caller reached EOS, including limit exhaustion; it does not mean every
 candidate was read. Open profiles are partial. Cancellation is observable
 before another `Next()`; terminal complete/failed states are retained through
@@ -137,8 +147,11 @@ predicate) and `rows_limited` (matching decoded rows discarded by the limit).
 Unread rows are not estimated. `limit_stops` and `cancellation_stops` are each
 zero or one: the former records delivering the requested limit (or completing a zero limit),
 the latter records cancellation observed by `Next()` while open. Repeated EOS
-or cancellation calls do not increment them. `data_files_pruned` and
-`row_groups_pruned` are measured zero in the current scanner.
+or cancellation calls do not increment them. `data_files_pruned` counts
+candidate files skipped by conservative manifest pruning before opening Parquet,
+and `row_groups_pruned` counts row groups skipped by conservative Parquet footer
+pruning before reading column chunks; files or row groups left unread because of
+`limit` or cancellation are never counted as pruned.
 
 `arrow_bytes` and `peak_arrow_bytes` measure live/high-water allocation sizes in
 that cursor's Arrow pool, covering decoding and retained output; they exclude

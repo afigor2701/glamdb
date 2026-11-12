@@ -283,6 +283,10 @@ public:
     {
         return Inner_->ReadOnlyFileIO();
     }
+    std::shared_ptr<detail::TSnapshotMetadataCache> ReadMetadataCache() override
+    {
+        return Inner_->ReadMetadataCache();
+    }
 
     Result<std::shared_ptr<const NGlamDB::NStorage::TBaseState>> VerifiedScanState(const BaseIdentity& base) override
     {

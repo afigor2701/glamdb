@@ -79,7 +79,7 @@ TEST_F(NativeMetadata, ReportsSelectedViewsAndDurableHistory)
     EXPECT_EQ(history->snapshots[1].parent_snapshot_id, a.snapshot_id);
 }
 
-TEST_F(NativeMetadata, ExplainsValidatedScansWithoutInventingPruningOrSelectivity)
+TEST_F(NativeMetadata, ExplainsValidatedScansWithPruningAndWithoutInventingSelectivity)
 {
     const auto a = Append(FirstOperation, FirstRows);
     const ScanRequest request{.collection_id = test::collection_id,
@@ -101,8 +101,8 @@ TEST_F(NativeMetadata, ExplainsValidatedScansWithoutInventingPruningOrSelectivit
     EXPECT_EQ(explanation->candidates.rows.value, 3);
     EXPECT_EQ(explanation->candidates.data_files.value, 1);
     EXPECT_FALSE(explanation->estimated_output_rows.value);
-    EXPECT_FALSE(explanation->file_pruning);
-    EXPECT_FALSE(explanation->row_group_pruning);
+    EXPECT_TRUE(explanation->file_pruning);
+    EXPECT_TRUE(explanation->row_group_pruning);
     const auto unfiltered = Engine_->ExplainScan({.collection_id = test::collection_id, .limit = 1});
     ASSERT_TRUE(unfiltered);
     EXPECT_EQ(unfiltered->estimated_output_rows.value, 1);
@@ -151,7 +151,8 @@ TEST_F(NativeMetadata, ProfilesActualWorkAndPreservesZeroLimitLaziness)
     EXPECT_EQ(profile.rows_returned.value, 2);
     EXPECT_EQ(profile.rows_decoded.value, 3);
     EXPECT_EQ(profile.data_files_read.value, 1);
-    EXPECT_EQ(profile.data_bytes_read.value, a.compressed_data_bytes_added);
+    EXPECT_GT(profile.data_bytes_read.value.value_or(0), 0);
+    EXPECT_LT(profile.data_bytes_read.value.value_or(a.compressed_data_bytes_added), a.compressed_data_bytes_added);
     EXPECT_EQ(profile.manifests_read.value, 0);
     EXPECT_FALSE(profile.elapsed_us.value);
     ASSERT_TRUE(cursor.Next());
@@ -177,8 +178,8 @@ TEST_F(NativeMetadata, ReportsCapabilitiesAndRejectsMetadataAfterShutdown)
     EXPECT_TRUE(capabilities.append);
     EXPECT_TRUE(capabilities.scan);
     EXPECT_TRUE(capabilities.metadata);
-    EXPECT_FALSE(capabilities.file_pruning);
-    EXPECT_FALSE(capabilities.row_group_pruning);
+    EXPECT_TRUE(capabilities.file_pruning);
+    EXPECT_TRUE(capabilities.row_group_pruning);
     EXPECT_FALSE(capabilities.durability_qualified);
     ASSERT_TRUE(Engine_->Shutdown(std::chrono::milliseconds(1000)));
     const auto result = Engine_->GetStatistics(test::collection_id);

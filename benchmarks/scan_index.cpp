@@ -6,6 +6,7 @@
 #include "tests/support/temp_dir.h"
 
 #include <arrow/api.h>
+#include <iceberg/manifest/manifest_entry.h>
 
 #include <charconv>
 #include <chrono>
@@ -66,10 +67,35 @@ size_t IndexCapacity(const NGlamDB::NStorage::TScanMembership& index)
 {
     size_t bytes = sizeof(index) + index.Files.capacity() * sizeof(NGlamDB::NStorage::TScanDataFile) +
         index.Snapshots.capacity() * sizeof(NGlamDB::NStorage::TSnapshotBoundary);
-    // Logical store URIs exceed string's inline storage. This counts retained
-    // container/string capacity, excluding allocator rounding and control blocks.
+    // Logical store URIs exceed string's inline storage. This counts TScanMembership's
+    // own vector and path-string capacities, excluding allocator rounding, shared-pointer
+    // control blocks, and shared iceberg::DataFile descriptors (reported separately below).
     for (const auto& file : index.Files) {
         bytes += file.Path.capacity() + 1;
+    }
+    return bytes;
+}
+
+size_t DataFileDescriptorBytes(const NGlamDB::NStorage::TScanMembership& index)
+{
+    size_t bytes = 0;
+    for (const auto& entry : index.Files) {
+        if (!entry.DataFile) {
+            continue;
+        }
+        const auto& file = *entry.DataFile;
+        bytes += sizeof(iceberg::DataFile) + file.file_path.capacity() + 1;
+        const size_t scalarMaps = file.column_sizes.size() + file.value_counts.size() + file.null_value_counts.size() +
+            file.nan_value_counts.size();
+        bytes += scalarMaps * 48;
+        for (const auto& [fieldId, bound] : file.lower_bounds) {
+            (void)fieldId;
+            bytes += 64 + bound.capacity();
+        }
+        for (const auto& [fieldId, bound] : file.upper_bounds) {
+            (void)fieldId;
+            bytes += 64 + bound.capacity();
+        }
     }
     return bytes;
 }
@@ -167,7 +193,8 @@ try {
               << ",\"warm_metadata_opens\":" << scanOpens
               << ",\"uncached_metadata_opens_per_plan\":" << referenceReads / ReferenceRepeats
               << ",\"reopen_us\":" << reopenUs << ",\"reopen_metadata_opens\":" << reopenReads
-              << ",\"index_capacity_bytes\":" << IndexCapacity(*state->ScanIndex) << "}\n";
+              << ",\"index_capacity_bytes\":" << IndexCapacity(*state->ScanIndex)
+              << ",\"datafile_descriptor_bytes\":" << DataFileDescriptorBytes(*state->ScanIndex) << "}\n";
     Require(engine->Shutdown(std::chrono::seconds(1)).has_value(), "shutdown failed");
     return 0;
 } catch (const std::exception& error) {
