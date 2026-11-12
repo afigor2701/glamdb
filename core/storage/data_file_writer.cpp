@@ -20,6 +20,7 @@
 #include <iceberg/type.h>
 #include <iceberg/util/macros.h>
 #include <parquet/metadata.h>
+#include <parquet/statistics.h>
 
 #include <algorithm>
 #include <cmath>
@@ -393,16 +394,44 @@ iceberg::Result<TDataWriteResult> WriteDataFile(std::shared_ptr<iceberg::FileIO>
         const auto& receipt = *record.Value().Receipt;
         ICEBERG_ASSIGN_OR_RAISE(auto dataFile, MakeDataFile(*writer, metadata, path, shape, receipt));
         ICEBERG_ASSIGN_OR_RAISE(auto input, fileIO->NewInputFile(path));
-        ICEBERG_ASSIGN_OR_RAISE(auto footer,
+        ICEBERG_ASSIGN_OR_RAISE(auto verifiedFooter,
             ReadParquetFooter(*input,
                 *schema,
                 {static_cast<std::int64_t>(receipt.Length), shape.Rows},
                 {limits.MaxFileBytes}));
-        ICEBERG_RETURN_UNEXPECTED(CheckColumnCodecs(*footer, *schema, writeSpec));
+        ICEBERG_RETURN_UNEXPECTED(CheckColumnCodecs(*verifiedFooter, *schema, writeSpec));
+        // Upstream iceberg-cpp CollectBounds folds row-group min/max only over row groups
+        // where HasMinMax() is true, omitting non-all-NULL row groups whose statistics were
+        // suppressed (e.g. strings > 4096 bytes). Drop incomplete file bounds so manifest
+        // pruning never assumes unmeasured row groups lie within measured ones.
+        const auto schemaFields = schema->fields();
+        for (std::size_t col = 0; col < schemaFields.size(); ++col) {
+            const auto fieldID = schemaFields[col].field_id();
+            bool completeMinMax = true;
+            for (int rg = 0; rg < verifiedFooter->num_row_groups(); ++rg) {
+                const auto group = verifiedFooter->RowGroup(rg);
+                const auto groupRows = group->num_rows();
+                if (groupRows <= 0) {
+                    continue;
+                }
+                const auto chunk = group->ColumnChunk(static_cast<int>(col));
+                const auto encoded = chunk ? chunk->encoded_statistics() : nullptr;
+                const bool allNull = encoded != nullptr &&
+                    (encoded->all_null_value || (encoded->has_null_count && encoded->null_count == groupRows));
+                if (!allNull && (encoded == nullptr || !encoded->has_min || !encoded->has_max)) {
+                    completeMinMax = false;
+                    break;
+                }
+            }
+            if (!completeMinMax) {
+                dataFile->lower_bounds.erase(fieldID);
+                dataFile->upper_bounds.erase(fieldID);
+            }
+        }
         if (auto error = attempt->MarkFormatVerified(path)) {
             return iceberg::IOError(error.message());
         }
-        return TDataWriteResult{std::move(dataFile), receipt, footer->size()};
+        return TDataWriteResult{std::move(dataFile), receipt, verifiedFooter->size()};
     });
     if (!result && attempt) {
         attempt->FailFile(path, std::make_error_code(std::errc::io_error));

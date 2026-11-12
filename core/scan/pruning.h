@@ -39,18 +39,22 @@ struct TColumnZoneStats
     bool UpperExact = true;
 };
 
-// Extracts and validates Iceberg manifest column metrics for `readFields`.
-// Corrupt or out-of-domain persisted statistics fail with `CORRUPTION` before pruning.
+// Extracts Iceberg manifest column metrics for `readFields`.
+// Malformed, incomplete, or contradictory per-column statistics are discarded
+// (`prune nothing`) so exact column decoding and validation handle the file.
 Result<std::vector<TColumnZoneStats>> ExtractFileZoneStats(const iceberg::DataFile& dataFile,
     const iceberg::Schema& icebergSchema,
     const SchemaSpec& schema,
     std::span<const size_t> readFields);
 
-// Extracts and validates Parquet row-group statistics for `readFields`.
-// Corrupt or out-of-domain persisted statistics fail with `CORRUPTION` before pruning.
+// Extracts Parquet row-group statistics for `readFields`.
+// Malformed, incomplete, or contradictory per-column statistics are discarded
+// (`prune nothing`); Float64 bounds require a zero manifest `nan_value_counts` entry.
 Result<std::vector<TColumnZoneStats>> ExtractRowGroupZoneStats(const parquet::RowGroupMetaData& group,
     const SchemaSpec& schema,
-    std::span<const size_t> readFields);
+    std::span<const size_t> readFields,
+    const iceberg::DataFile* dataFile = nullptr,
+    const iceberg::Schema* icebergSchema = nullptr);
 
 // Evaluates conservative SQL three-valued truth possibilities over a zone.
 // `readFields` must be sorted and paired 1:1 with `readStats`, covering `predicate.ReferencedFields`.
@@ -59,7 +63,7 @@ Result<TZoneTruth> EvaluateZonePredicate(const TBoundPredicate& predicate,
     std::span<const size_t> readFields,
     std::span<const TColumnZoneStats> readStats);
 
-// Returns true iff every referenced column carries zone statistics and `CanBeTrue` is false.
+// Returns true iff `EvaluateZonePredicate` proves `CanBeTrue` is false for the zone.
 Result<bool> CanPruneZone(const TBoundPredicate& predicate,
     int64_t rowCount,
     std::span<const size_t> readFields,

@@ -282,5 +282,133 @@ TEST_F(ScanReadErrorClassificationTest, PositionalParquetScanReadsNeededRangesAn
     EXPECT_EQ(CountRows(), static_cast<int64_t>(FirstRows.size()));
 }
 
+TEST_F(ScanReadErrorClassificationTest, LimitCompletionUsesCheckedCloseWhileCancelUsesBestEffort)
+{
+    // 1. Mid-file limit (.limit = 1 out of 3 rows): first Next() delivers 1 row;
+    //    second Next() closes the open Parquet stream via FinishFile() and surfaces IO_ERROR.
+    Faults_->AddRule({EIOOp::Close, "*.parquet", 1, 1, std::make_error_code(std::errc::io_error), std::nullopt});
+    {
+        const auto cursor = Engine_->Scan({
+            .collection_id = test::collection_id,
+            .projection = std::vector<std::string>{"key"},
+            .limit = 1,
+        });
+        ASSERT_TRUE(cursor);
+        const auto first = (*cursor)->Next();
+        ASSERT_TRUE(first) << first.error().message;
+        ASSERT_NE(*first, nullptr);
+        EXPECT_EQ((*first)->num_rows(), 1);
+
+        const auto second = (*cursor)->Next();
+        ASSERT_FALSE(second) << "expected Close failure on limit EOS instead of silent EOS";
+        EXPECT_EQ(second.error().code, "IO_ERROR") << second.error().message;
+        EXPECT_EQ((*cursor)->Profile().state, ScanState::Failed);
+        EXPECT_TRUE(Engine_->GetHealth().read_available);
+
+        // Sticky terminal failure on repeated Next().
+        const auto third = (*cursor)->Next();
+        ASSERT_FALSE(third);
+        EXPECT_EQ(third.error().code, "IO_ERROR");
+    }
+
+    // 2. Exact end-of-file limit (.limit == FirstRows.size(), reached before reading EOF batch):
+    //    next Next() still performs checked close and surfaces IO_ERROR.
+    Faults_->AddRule({EIOOp::Close, "*.parquet", 1, 1, std::make_error_code(std::errc::io_error), std::nullopt});
+    {
+        const auto cursor = Engine_->Scan({
+            .collection_id = test::collection_id,
+            .projection = std::vector<std::string>{"key"},
+            .limit = static_cast<int64_t>(FirstRows.size()),
+            .batch_rows = 2,
+        });
+        ASSERT_TRUE(cursor);
+        int64_t got = 0;
+        while (got < static_cast<int64_t>(FirstRows.size())) {
+            const auto batch = (*cursor)->Next();
+            ASSERT_TRUE(batch) << batch.error().message;
+            ASSERT_NE(*batch, nullptr);
+            got += (*batch)->num_rows();
+        }
+        EXPECT_EQ(got, static_cast<int64_t>(FirstRows.size()));
+
+        const auto eos = (*cursor)->Next();
+        ASSERT_FALSE(eos);
+        EXPECT_EQ(eos.error().code, "IO_ERROR") << eos.error().message;
+        EXPECT_EQ((*cursor)->Profile().state, ScanState::Failed);
+        EXPECT_TRUE(Engine_->GetHealth().read_available);
+    }
+
+    // 3. Cancellation after hitting .limit = 1 uses best-effort Abort() and returns CANCELLED.
+    Faults_->AddRule({EIOOp::Close, "*.parquet", 1, 1, std::make_error_code(std::errc::io_error), std::nullopt});
+    {
+        const auto cursor = Engine_->Scan({
+            .collection_id = test::collection_id,
+            .projection = std::vector<std::string>{"key"},
+            .limit = 1,
+        });
+        ASSERT_TRUE(cursor);
+        const auto first = (*cursor)->Next();
+        ASSERT_TRUE(first) << first.error().message;
+        ASSERT_NE(*first, nullptr);
+        EXPECT_EQ((*first)->num_rows(), 1);
+
+        (*cursor)->Cancel();
+        const auto cancelled = (*cursor)->Next();
+        ASSERT_FALSE(cancelled);
+        EXPECT_EQ(cancelled.error().code, "CANCELLED") << cancelled.error().message;
+        EXPECT_EQ((*cursor)->Profile().state, ScanState::Cancelled);
+        EXPECT_TRUE(Engine_->GetHealth().read_available);
+    }
+
+    // 4. Limit reached inside the 2nd data file after normal checked close of the 1st data file.
+    const auto secondAppend = Engine_->AppendDurable({test::collection_id, SecondOperation, {}, {Batch(SecondRows)}});
+    ASSERT_EQ(secondAppend.disposition, CommitDisposition::Committed);
+    Faults_->AddRule({EIOOp::Close, "*.parquet", 2, 1, std::make_error_code(std::errc::io_error), std::nullopt});
+    {
+        const int64_t targetRows = static_cast<int64_t>(FirstRows.size()) + 1;
+        const auto cursor = Engine_->Scan({
+            .collection_id = test::collection_id,
+            .projection = std::vector<std::string>{"key"},
+            .limit = targetRows,
+            .batch_rows = 2,
+        });
+        ASSERT_TRUE(cursor);
+        int64_t got = 0;
+        while (got < targetRows) {
+            const auto batch = (*cursor)->Next();
+            ASSERT_TRUE(batch) << batch.error().message;
+            ASSERT_NE(*batch, nullptr);
+            got += (*batch)->num_rows();
+        }
+        EXPECT_EQ(got, targetRows);
+
+        const auto eos = (*cursor)->Next();
+        ASSERT_FALSE(eos);
+        EXPECT_EQ(eos.error().code, "IO_ERROR") << eos.error().message;
+        EXPECT_EQ((*cursor)->Profile().state, ScanState::Failed);
+        EXPECT_TRUE(Engine_->GetHealth().read_available);
+    }
+
+    // 5. .limit = 0 opens no Parquet file and completes cleanly even when OpenRead/Close would fail.
+    Faults_->AddRule({EIOOp::OpenRead, "*.parquet", 1, 10, std::make_error_code(std::errc::io_error), std::nullopt});
+    Faults_->AddRule({EIOOp::Close, "*.parquet", 1, 10, std::make_error_code(std::errc::io_error), std::nullopt});
+    {
+        const auto cursor = Engine_->Scan({
+            .collection_id = test::collection_id,
+            .projection = std::vector<std::string>{"key"},
+            .limit = 0,
+        });
+        ASSERT_TRUE(cursor);
+        const auto eos = (*cursor)->Next();
+        ASSERT_TRUE(eos) << eos.error().message;
+        EXPECT_EQ(*eos, nullptr);
+        const auto profile = (*cursor)->Profile();
+        EXPECT_EQ(profile.state, ScanState::Complete);
+        EXPECT_EQ(profile.data_files_read.value, 0);
+        EXPECT_EQ(profile.rows_returned.value, 0);
+        EXPECT_EQ(profile.limit_stops.value, 1);
+    }
+}
+
 } // namespace
 } // namespace glamdb

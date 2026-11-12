@@ -184,14 +184,21 @@ joins a writer attempt or holds a SQLite read transaction.
   manifest column bounds and null/value counts (`ExtractFileZoneStats`). Only
   zones proven `AlwaysFalse` or `AlwaysUnknown` at the predicate root are
   pruned (`CanPruneZone`); Iceberg 16-byte string upper-bound truncation ties are
-  treated conservatively (`UpperBoundExact = false`, so `Ne` never falsely prunes
+  treated conservatively (`UpperExact = false`, so `Ne` never falsely prunes
   a truncated tie). Statistics for every field in `ReadFields_` (`projection ∪
   predicate`) are domain-checked first (inconsistent counts, inverted bounds,
   NaN/Inf floats, `-0.0` normalization, out-of-range timestamps, `key > 1024` or
-  `string > 1 MiB`); malformed statistics on `ReadFields_` fail with
-  `CORRUPTION` rather than silently skipping or keeping a corrupt file.
+  `string > 1 MiB`); malformed, incomplete or contradictory statistics on a
+  column are conservatively discarded (`prune nothing`) so exact column decoding
+  and `ValidateColumn` inspect the data rather than failing or skipping rows at
+  the pruning stage. Non-`key` manifest string upper bounds with `>= 16` UTF-8
+  code points (`truncate(16)`) are also omitted at the manifest level while exact
+  Parquet row-group statistics still prune, and `Float64` bounds require a
+  confirmed zero manifest `nan_value_counts` entry.
 - Surviving files open through positional `TScanRandomAccessFile` (`pread` over
-  `IReadOnlyFileIO`, recording exact `BytesRead` and validating `Close()`),
+  `IReadOnlyFileIO`, recording exact `BytesRead` and validating `Close()`,
+  including when `limit` completes a scan inside an open file; only cancellation
+  and already-failed scans close best-effort),
   eliminating whole-file 32 MiB buffers. On a footer cache miss,
   `ReadParquetFooterFromStream` reads only the magic/tail/footer ranges and
   verifies the footer with the same rules as recovery: unencrypted metadata,
@@ -281,16 +288,23 @@ before the contract fix and passed afterward. Sanitizer profiles and browser E2E
 
 Positional Parquet I/O, conservative SQL-3VL manifest/row-group pruning and
 `TSnapshotMetadataCache` were validated after rebasing onto official main
-`b4f5ec6`: `ScanPruningUnitTest` (exhaustive SQL-3VL zone truth tables against
-the row oracle, truncated-string `Ne` safety and corrupt-stats rejection),
-`SnapshotMetadataCacheUnitTest` (per-kind/byte LRU caps, oversize bypass,
-eviction and thread safety), `ScanPruningVerticalTest` (differential parity with
-`EnablePruning = false`, zero Parquet opens on manifest-pruned files, multi-row-group
-positional `PRead` savings, corrupt stats failing closed on `ReadFields_`, and
-warm metadata/footer cache hits), `ScanReadErrorClassificationTest`,
-`glamdb.installed_consumer`, the `GLAMDB_BUILD_STORAGE=OFF` contour, and
-`NativeMetadataHTTP` wire-schema checks passed locally with `format-check`
-(`tidy-check` and sanitizer presets were not run in this change).
+`47cc955`: `ScanPruningUnitTest` (exhaustive SQL-3VL zone truth tables against
+the row oracle, truncated-string `Ne` and `truncate(16)` upper-bound safety,
+`Float64` `nan_value_counts` gating, and conservative `prune nothing` fallback on
+malformed/contradictory manifest and Parquet statistics),
+`SnapshotMetadataCacheUnitTest` and `SnapshotMetadataCacheGlobalOomTest`
+(per-kind/byte LRU caps, oversize bypass, zero-allocation lookups, strong
+exception safety under `std::bad_alloc`, eviction and thread safety),
+`ScanPruningVerticalTest` (differential parity with `EnablePruning = false` across
+600+ generated 3VL predicates, multi-row-group `> 4096`-byte string manifest-bound
+omission, on-disk corrupt footer statistics `prune nothing`, zero Parquet opens on
+manifest-pruned files, byte-exact positional `PRead` accounting, warm metadata/footer
+cache hits, and `ENOMEM` column-read classification), `ScanReadErrorClassificationTest`
+(including checked close on `limit` completion vs best-effort close on `Cancel()`),
+`glamdb_scan_data_reads_bench`, `glamdb.installed_consumer`, the
+`GLAMDB_BUILD_STORAGE=OFF` contour, and `NativeMetadataHTTP` wire-schema checks
+passed locally with `format-check` (`tidy-check` and sanitizer presets were not
+run in this change).
 
 Value validation reads only decoded columns of the projection and predicate;
 latent corruption in unread columns or unread data pages is not detected by

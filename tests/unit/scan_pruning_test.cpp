@@ -16,12 +16,15 @@
 #include <parquet/file_reader.h>
 #include <parquet/metadata.h>
 #include <parquet/properties.h>
+#include <parquet/statistics.h>
 
 #include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <functional>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -411,17 +414,57 @@ TEST(ScanPruningUnitTest, PrunesProvenImpossibleZonesAndPreservesTruncatedNeSafe
     // Range miss on truncated prefix ("bbb" > "aaa...") DOES safely prune `label == "bbb"`!
     checkPruned(Predicate::Compare("label", CompareOp::Eq, std::string("bbb")), true);
 
-    // Missing statistics (`HasStats == false`) conservatively disables pruning.
+    // Partial valid statistics (`HasStats == true`, bounds omitted e.g. >4 KiB strings or missing nan_value_counts)
+    // do not prune range predicates on that column, while still allowing valid sibling columns in `AND` to prune.
+    auto partialStats = stats;
+    partialStats[2].LowerBound.reset();
+    partialStats[2].UpperBound.reset();
+    {
+        const auto boundRange = BindPredicate(Predicate::Compare("count", CompareOp::Gt, int64_t{100}), FullSchema);
+        ASSERT_TRUE(boundRange);
+        const auto rangePruned = CanPruneZone(*boundRange, 8, fields, partialStats);
+        ASSERT_TRUE(rangePruned);
+        EXPECT_FALSE(*rangePruned);
+
+        const auto boundSiblingAnd = BindPredicate(Predicate::And({
+                                                       Predicate::Compare("key", CompareOp::Lt, std::string("d")),
+                                                       Predicate::Compare("count", CompareOp::Gt, int64_t{100}),
+                                                   }),
+            FullSchema);
+        ASSERT_TRUE(boundSiblingAnd);
+        const auto siblingAndPruned = CanPruneZone(*boundSiblingAnd, 8, fields, partialStats);
+        ASSERT_TRUE(siblingAndPruned);
+        EXPECT_TRUE(*siblingAndPruned);
+    }
+
+    // Missing or malformed statistics (`HasStats == false`) on a referenced predicate column disable
+    // pruning for the entire zone (including `CompareNull` and `AND`), ensuring `ValidateColumn` runs.
     auto unstat = stats;
-    unstat[2].HasStats = false;
-    const auto boundCompareNull = BindPredicate(Predicate::CompareNull("count", CompareOp::Eq), FullSchema);
-    ASSERT_TRUE(boundCompareNull);
-    const auto unstatPruned = CanPruneZone(*boundCompareNull, 8, fields, unstat);
-    ASSERT_TRUE(unstatPruned);
-    EXPECT_FALSE(*unstatPruned);
+    unstat[2] = TColumnZoneStats{
+        .Type = FieldType::Int64,
+        .Nullable = true,
+        .HasStats = false,
+    };
+    for (const auto& pred : {
+             Predicate::Compare("count", CompareOp::Gt, int64_t{100}),
+             Predicate::CompareNull("count", CompareOp::Eq),
+             Predicate::IsNull("count"),
+             Predicate::IsNotNull("count"),
+             Predicate::And({
+                 Predicate::Compare("key", CompareOp::Lt, std::string("d")),
+                 Predicate::Compare("count", CompareOp::Gt, int64_t{100}),
+             }),
+         })
+    {
+        const auto bound = BindPredicate(pred, FullSchema);
+        ASSERT_TRUE(bound);
+        const auto unstatPruned = CanPruneZone(*bound, 8, fields, unstat);
+        ASSERT_TRUE(unstatPruned);
+        EXPECT_FALSE(*unstatPruned);
+    }
 }
 
-TEST(ScanPruningUnitTest, RejectsCorruptManifestAndParquetStatisticsBeforePruning)
+TEST(ScanPruningUnitTest, DiscardsMalformedAndContradictoryManifestAndParquetStatisticsWithoutPruning)
 {
     const auto profile = NGlamDB::NStorage::MakeTableProfile(ToStorageSchema(FullSchema));
     ASSERT_TRUE(profile.has_value());
@@ -432,68 +475,199 @@ TEST(ScanPruningUnitTest, RejectsCorruptManifestAndParquetStatisticsBeforePrunin
     validFile.value_counts = {{1, 4}, {2, 4}, {3, 4}, {4, 4}, {5, 4}, {6, 4}};
     validFile.null_value_counts = {{1, 0}, {2, 1}, {3, 0}, {4, 0}, {5, 0}, {6, 0}};
     validFile.nan_value_counts = {{5, 0}};
-    validFile.lower_bounds[1] = EncodeString("a");
-    validFile.upper_bounds[1] = EncodeString("z");
+    validFile.lower_bounds[1] = EncodeString("c");
+    validFile.upper_bounds[1] = EncodeString("x");
+    validFile.lower_bounds[2] = EncodeString("lbl_c");
+    validFile.upper_bounds[2] = EncodeString("lbl_x");
     validFile.lower_bounds[3] = {0};
     validFile.upper_bounds[3] = {1};
-    validFile.lower_bounds[4] = EncodeInt64(1);
-    validFile.upper_bounds[4] = EncodeInt64(9);
+    validFile.lower_bounds[4] = EncodeInt64(10);
+    validFile.upper_bounds[4] = EncodeInt64(20);
     validFile.lower_bounds[5] = EncodeDouble(0.0);
     validFile.upper_bounds[5] = EncodeDouble(1.5);
-    validFile.lower_bounds[6] = EncodeInt64(10);
-    validFile.upper_bounds[6] = EncodeInt64(20);
+    validFile.lower_bounds[6] = EncodeInt64(100);
+    validFile.upper_bounds[6] = EncodeInt64(200);
 
     const std::vector<size_t> allFields{0, 1, 2, 3, 4, 5};
-    ASSERT_TRUE(ExtractFileZoneStats(validFile, icebergSchema, FullSchema, allFields));
+    const auto validStats = ExtractFileZoneStats(validFile, icebergSchema, FullSchema, allFields);
+    ASSERT_TRUE(validStats) << validStats.error().message;
 
-    const auto expectCorruptManifest = [&](auto mutate) {
+    const auto checkZonePruned =
+        [&](const std::vector<TColumnZoneStats>& zoneStats, const Predicate& pred, bool expected) {
+            const auto bound = BindPredicate(pred, FullSchema);
+            ASSERT_TRUE(bound) << bound.error().message;
+            const auto pruned = CanPruneZone(*bound, validFile.record_count, allFields, zoneStats);
+            ASSERT_TRUE(pruned) << pruned.error().message;
+            EXPECT_EQ(*pruned, expected);
+        };
+
+    checkZonePruned(*validStats, Predicate::Compare("key", CompareOp::Lt, std::string("c")), true);
+    checkZonePruned(*validStats, Predicate::Compare("count", CompareOp::Gt, int64_t{20}), true);
+    checkZonePruned(*validStats, Predicate::Compare("score", CompareOp::Gt, 2.0), true);
+    checkZonePruned(*validStats, Predicate::Compare("at", CompareOp::Gt, TimestampUs{200}), true);
+
+    const auto expectManifestColumnReset = [&](size_t colIdx, auto mutate, const Predicate& unprunedPred) {
         auto bad = validFile;
         mutate(bad);
         const auto res = ExtractFileZoneStats(bad, icebergSchema, FullSchema, allFields);
-        ASSERT_FALSE(res);
-        EXPECT_EQ(res.error().code, "CORRUPTION") << res.error().message;
+        ASSERT_TRUE(res) << res.error().message;
+        EXPECT_FALSE((*res)[colIdx].HasStats);
+        EXPECT_FALSE((*res)[colIdx].NullCount.has_value());
+        EXPECT_FALSE((*res)[colIdx].LowerBound.has_value());
+        EXPECT_FALSE((*res)[colIdx].UpperBound.has_value());
+        checkZonePruned(*res, unprunedPred, false);
+        const Predicate siblingPred = (colIdx == 0) ? Predicate::Compare("count", CompareOp::Gt, int64_t{100})
+                                                    : Predicate::Compare("key", CompareOp::Lt, std::string("b"));
+        // Referencing the malformed column in `AND` also refuses to prune so `ValidateColumn` runs on it,
+        // whereas predicates referencing only valid columns still prune even when the malformed column is projected!
+        checkZonePruned(*res, Predicate::And({unprunedPred, siblingPred}), false);
+        checkZonePruned(*res, siblingPred, true);
     };
 
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.nan_value_counts[5] = 1;
-    });
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.value_counts[1] = 3;
-    });
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.null_value_counts[1] = 1;
-    }); // required column
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.null_value_counts[2] = 5;
-    }); // > record_count
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.null_value_counts[4] = 4;
-    }); // all-null with bounds present
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.lower_bounds[4] = EncodeInt64(100);
-    }); // lower > upper
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.lower_bounds[3] = {2};
-    }); // invalid bool byte
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.lower_bounds[5] = EncodeDouble(std::numeric_limits<double>::quiet_NaN());
-    });
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.upper_bounds[5] = EncodeDouble(std::numeric_limits<double>::infinity());
-    });
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.upper_bounds[6] = EncodeInt64(253402300800000000LL);
-    });
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.lower_bounds[1] = {0xFF, 0xFE};
-    }); // invalid UTF-8
-    expectCorruptManifest([](iceberg::DataFile& f) {
-        f.upper_bounds[1] = std::vector<uint8_t>(1025, 'k');
-    });
+    // Contradictory counts, NaN counts, required nulls, all-null with bounds:
+    expectManifestColumnReset(
+        4,
+        [](iceberg::DataFile& f) {
+            f.nan_value_counts[5] = 1;
+        },
+        Predicate::Compare("score", CompareOp::Gt, 10.0));
+    expectManifestColumnReset(
+        4,
+        [](iceberg::DataFile& f) {
+            f.nan_value_counts[5] = 1;
+        },
+        Predicate::IsNull("score"));
+    expectManifestColumnReset(
+        0,
+        [](iceberg::DataFile& f) {
+            f.value_counts[1] = 3;
+        },
+        Predicate::Compare("key", CompareOp::Lt, std::string("a")));
+    expectManifestColumnReset(
+        0,
+        [](iceberg::DataFile& f) {
+            f.null_value_counts[1] = 1; // required column -> even IS NULL must NOT prune!
+        },
+        Predicate::IsNull("key"));
+    expectManifestColumnReset(
+        1,
+        [](iceberg::DataFile& f) {
+            f.null_value_counts[2] = 5; // > record_count
+        },
+        Predicate::Compare("label", CompareOp::Lt, std::string("a")));
+    expectManifestColumnReset(
+        1,
+        [](iceberg::DataFile& f) {
+            f.null_value_counts[2] = -1;
+        },
+        Predicate::IsNull("label"));
+    expectManifestColumnReset(
+        3,
+        [](iceberg::DataFile& f) {
+            f.null_value_counts[4] = 4; // all-null with bounds present
+        },
+        Predicate::IsNotNull("count"));
 
-    // Parquet writers emit -0.0 as min for +0.0 (PARQUET-1222); ExtractFileZoneStats
-    // normalizes -0.0 to +0.0, while out-of-range timestamps in Parquet stats fail CORRUPTION.
+    // Inverted bounds (lower > upper) across all 5 types:
+    expectManifestColumnReset(
+        0,
+        [](iceberg::DataFile& f) {
+            f.lower_bounds[1] = EncodeString("z");
+            f.upper_bounds[1] = EncodeString("a");
+        },
+        Predicate::Compare("key", CompareOp::Eq, std::string("m")));
+    expectManifestColumnReset(
+        2,
+        [](iceberg::DataFile& f) {
+            f.lower_bounds[3] = {1};
+            f.upper_bounds[3] = {0};
+        },
+        Predicate::Compare("flag", CompareOp::Eq, true));
+    expectManifestColumnReset(
+        3,
+        [](iceberg::DataFile& f) {
+            f.lower_bounds[4] = EncodeInt64(100);
+            f.upper_bounds[4] = EncodeInt64(10);
+        },
+        Predicate::Compare("count", CompareOp::Eq, int64_t{50}));
+    expectManifestColumnReset(
+        4,
+        [](iceberg::DataFile& f) {
+            f.lower_bounds[5] = EncodeDouble(10.0);
+            f.upper_bounds[5] = EncodeDouble(1.0);
+        },
+        Predicate::Compare("score", CompareOp::Eq, 5.0));
+    expectManifestColumnReset(
+        5,
+        [](iceberg::DataFile& f) {
+            f.lower_bounds[6] = EncodeInt64(500);
+            f.upper_bounds[6] = EncodeInt64(100);
+        },
+        Predicate::Compare("at", CompareOp::Eq, TimestampUs{250}));
+
+    // Invalid encodings, invalid UTF-8 (0xC3), NaN/Inf, wrong byte widths, domain overflows:
+    expectManifestColumnReset(
+        1,
+        [](iceberg::DataFile& f) {
+            f.lower_bounds[2] = {0xC3}; // truncated 2-byte UTF-8 lead byte before "é" (0xC3 0xA9)
+        },
+        Predicate::Compare("label", CompareOp::Eq, std::string("\xC3\xA9")));
+    expectManifestColumnReset(
+        1,
+        [](iceberg::DataFile& f) {
+            f.upper_bounds[2] = {0xC3};
+        },
+        Predicate::Compare("label", CompareOp::Eq, std::string("\xC3\xA9")));
+    expectManifestColumnReset(
+        2,
+        [](iceberg::DataFile& f) {
+            f.lower_bounds[3] = {2};
+        },
+        Predicate::Compare("flag", CompareOp::Eq, false));
+    expectManifestColumnReset(
+        3,
+        [](iceberg::DataFile& f) {
+            f.lower_bounds[4] = {1, 2, 3}; // wrong byte width for Int64
+        },
+        Predicate::Compare("count", CompareOp::Gt, int64_t{100}));
+    expectManifestColumnReset(
+        4,
+        [](iceberg::DataFile& f) {
+            f.lower_bounds[5] = EncodeDouble(std::numeric_limits<double>::quiet_NaN());
+        },
+        Predicate::Compare("score", CompareOp::Gt, 10.0));
+    expectManifestColumnReset(
+        4,
+        [](iceberg::DataFile& f) {
+            f.upper_bounds[5] = EncodeDouble(std::numeric_limits<double>::infinity());
+        },
+        Predicate::Compare("score", CompareOp::Lt, -10.0));
+    expectManifestColumnReset(
+        5,
+        [](iceberg::DataFile& f) {
+            f.upper_bounds[6] = EncodeInt64(253402300800000000LL);
+        },
+        Predicate::Compare("at", CompareOp::Gt, TimestampUs{500}));
+    expectManifestColumnReset(
+        0,
+        [](iceberg::DataFile& f) {
+            f.upper_bounds[1] = std::vector<uint8_t>(1025, 'k');
+        },
+        Predicate::Compare("key", CompareOp::Gt, std::string("z")));
+
+    // Missing `nan_value_counts` drops Float64 bounds while keeping valid NullCount;
+    // -0.0 in manifest lower_bounds normalizes to +0.0.
     {
+        auto missingNanCount = validFile;
+        missingNanCount.nan_value_counts.erase(5);
+        const auto res = ExtractFileZoneStats(missingNanCount, icebergSchema, FullSchema, allFields);
+        ASSERT_TRUE(res) << res.error().message;
+        EXPECT_FALSE((*res)[4].LowerBound.has_value());
+        EXPECT_FALSE((*res)[4].UpperBound.has_value());
+        EXPECT_EQ((*res)[4].NullCount, 0);
+        checkZonePruned(*res, Predicate::Compare("score", CompareOp::Gt, 100.0), false);
+        checkZonePruned(*res, Predicate::IsNull("score"), true);
+
         auto negZeroManifest = validFile;
         negZeroManifest.lower_bounds[5] = EncodeDouble(-0.0);
         const auto ok = ExtractFileZoneStats(negZeroManifest, icebergSchema, FullSchema, allFields);
@@ -502,30 +676,238 @@ TEST(ScanPruningUnitTest, RejectsCorruptManifestAndParquetStatisticsBeforePrunin
         EXPECT_FALSE(std::signbit(std::get<double>(*(*ok)[4].LowerBound)));
     }
 
-    const auto batchRes = MakeRecordBatch(FullSchema,
-        std::vector<Row>{{std::string("k"), std::string("lbl"), true, int64_t{1}, 0.0, TimestampUs{10}}});
-    ASSERT_TRUE(batchRes);
-    arrow::TimestampBuilder badTsBuilder(arrow::timestamp(arrow::TimeUnit::MICRO, "UTC"), arrow::default_memory_pool());
-    ASSERT_TRUE(badTsBuilder.Append(253402300800000000LL).ok());
-    std::shared_ptr<arrow::Array> badTsArray;
-    ASSERT_TRUE(badTsBuilder.Finish(&badTsArray).ok());
-    const auto badBatch = arrow::RecordBatch::Make((*batchRes)->schema(),
+    // `truncate(16)` on non-key String (`label`, fieldID 2) drops >= 16-codepoint upper_bound
+    // at manifest level while keeping lower_bound; `key` (`full`, fieldID 1) keeps >= 16-codepoint upper_bound.
+    {
+        auto truncManifest = validFile;
+        const std::string key20 = "key_prefix_012345678"; // 20 code points
+        const std::string ascii16 = "shared_prefix_16";   // 16 ASCII code points
+        // 16 Cyrillic code points (32 UTF-8 bytes)
+        const std::string utf8_16 = "\xD0\xB0\xD0\xB1\xD0\xB2\xD0\xB3\xD0\xB4\xD0\xB5\xD0\xB6\xD0\xB7"
+                                    "\xD0\xB8\xD0\xB9\xD0\xBA\xD0\xBB\xD0\xBC\xD0\xBD\xD0\xBE\xD0\xBF";
+        truncManifest.lower_bounds[1] = EncodeString("key_a");
+        truncManifest.upper_bounds[1] = EncodeString(key20);
+        truncManifest.lower_bounds[2] = EncodeString(ascii16);
+        truncManifest.upper_bounds[2] = EncodeString(ascii16);
+        const auto resAscii = ExtractFileZoneStats(truncManifest, icebergSchema, FullSchema, allFields);
+        ASSERT_TRUE(resAscii) << resAscii.error().message;
+        EXPECT_TRUE((*resAscii)[0].UpperBound.has_value());
+        EXPECT_TRUE((*resAscii)[1].LowerBound.has_value());
+        EXPECT_FALSE((*resAscii)[1].UpperBound.has_value());
+        checkZonePruned(*resAscii, Predicate::Compare("key", CompareOp::Gt, key20), true);
+        checkZonePruned(*resAscii, Predicate::Compare("label", CompareOp::Eq, ascii16 + "_tail"), false);
+        checkZonePruned(*resAscii, Predicate::Compare("label", CompareOp::Lt, ascii16), true);
+
+        truncManifest.lower_bounds[2] = EncodeString("a");
+        truncManifest.upper_bounds[2] = EncodeString(utf8_16);
+        const auto resUtf8 = ExtractFileZoneStats(truncManifest, icebergSchema, FullSchema, allFields);
+        ASSERT_TRUE(resUtf8) << resUtf8.error().message;
+        EXPECT_FALSE((*resUtf8)[1].UpperBound.has_value());
+        checkZonePruned(*resUtf8, Predicate::Compare("label", CompareOp::Eq, utf8_16 + "_tail"), false);
+    }
+
+    // Build real Parquet metadata via FileMetaDataBuilder to test corrupt/contradictory row-group statistics.
+    const auto templateBatch = MakeRecordBatch(FullSchema,
+        std::vector<Row>{{std::string("k"), std::string("lbl"), true, int64_t{10}, 1.0, TimestampUs{100}}});
+    ASSERT_TRUE(templateBatch);
+    const auto templateTable = arrow::Table::FromRecordBatches({*templateBatch}).ValueOrDie();
+    auto templateSink = arrow::io::BufferOutputStream::Create().ValueOrDie();
+    ASSERT_TRUE(parquet::arrow::WriteTable(*templateTable, arrow::default_memory_pool(), templateSink, 16).ok());
+    const auto templateBytes = templateSink->Finish().ValueOrDie();
+    auto templateReader = parquet::ParquetFileReader::Open(std::make_shared<arrow::io::BufferReader>(templateBytes));
+    const auto* parquetSchema = templateReader->metadata()->schema();
+
+    const auto makeBytesString = [](std::span<const uint8_t> bytes) {
+        return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    };
+
+    const auto buildCustomRowGroupMeta =
+        [&](int64_t numRows,
+            const std::function<void(int col, int64_t& numValues, parquet::EncodedStatistics& enc)>& customize) {
+            auto props = parquet::default_writer_properties();
+            auto fb = parquet::FileMetaDataBuilder::Make(parquetSchema, props);
+            auto* rgb = fb->AppendRowGroup();
+            rgb->set_num_rows(numRows);
+            const std::map<parquet::Encoding::type, int32_t> emptyEnc{};
+            for (int col = 0; col < parquetSchema->num_columns(); ++col) {
+                auto* ccb = rgb->NextColumnChunk();
+                parquet::EncodedStatistics enc;
+                enc.set_null_count(0);
+                switch (col) {
+                    case 0:
+                        enc.set_min("c").set_max("x");
+                        break;
+                    case 1:
+                        enc.set_min("lbl_c").set_max("lbl_x");
+                        break;
+                    case 2:
+                        enc.set_min(std::string("\x00", 1)).set_max(std::string("\x01", 1));
+                        break;
+                    case 3:
+                        enc.set_min(makeBytesString(EncodeInt64(10))).set_max(makeBytesString(EncodeInt64(20)));
+                        break;
+                    case 4:
+                        enc.set_min(makeBytesString(EncodeDouble(0.0))).set_max(makeBytesString(EncodeDouble(1.5)));
+                        break;
+                    case 5:
+                        enc.set_min(makeBytesString(EncodeInt64(100))).set_max(makeBytesString(EncodeInt64(200)));
+                        break;
+                }
+                int64_t numValues = numRows;
+                customize(col, numValues, enc);
+                ccb->SetStatistics(enc);
+                ccb->Finish(numValues, 0, -1, 4, 32, 32, false, false, emptyEnc, emptyEnc);
+            }
+            rgb->Finish(192, 0);
+            return fb->Finish();
+        };
+
+    // Baseline valid custom row group prunes across all columns when validFile (`nan_value_counts[5] == 0`) is passed.
+    {
+        const auto okMeta = buildCustomRowGroupMeta(4, [](int, int64_t&, parquet::EncodedStatistics&) {
+        });
+        const auto rgStats =
+            ExtractRowGroupZoneStats(*okMeta->RowGroup(0), FullSchema, allFields, &validFile, &icebergSchema);
+        ASSERT_TRUE(rgStats) << rgStats.error().message;
+        checkZonePruned(*rgStats, Predicate::Compare("key", CompareOp::Lt, std::string("c")), true);
+        checkZonePruned(*rgStats, Predicate::Compare("score", CompareOp::Gt, 2.0), true);
+
+        // Without `dataFile` or with `nan_value_counts` missing, Float64 row-group bounds are dropped (`prune
+        // nothing`).
+        const auto noDataFileStats = ExtractRowGroupZoneStats(*okMeta->RowGroup(0), FullSchema, allFields);
+        ASSERT_TRUE(noDataFileStats) << noDataFileStats.error().message;
+        EXPECT_FALSE((*noDataFileStats)[4].LowerBound.has_value());
+        EXPECT_FALSE((*noDataFileStats)[4].UpperBound.has_value());
+        checkZonePruned(*noDataFileStats, Predicate::Compare("score", CompareOp::Gt, 2.0), false);
+    }
+
+    const auto expectParquetColumnReset = [&](int targetCol,
+                                              auto customizeCol,
+                                              const Predicate& unprunedPred,
+                                              const iceberg::DataFile* df = nullptr) {
+        const iceberg::DataFile* activeDf = df ? df : &validFile;
+        const auto meta = buildCustomRowGroupMeta(4, [&](int col, int64_t& numValues, parquet::EncodedStatistics& enc) {
+            if (col == targetCol) {
+                customizeCol(numValues, enc);
+            }
+        });
+        const auto res = ExtractRowGroupZoneStats(*meta->RowGroup(0), FullSchema, allFields, activeDf, &icebergSchema);
+        ASSERT_TRUE(res) << res.error().message;
+        EXPECT_FALSE((*res)[static_cast<size_t>(targetCol)].LowerBound.has_value());
+        EXPECT_FALSE((*res)[static_cast<size_t>(targetCol)].UpperBound.has_value());
+        checkZonePruned(*res, unprunedPred, false);
+    };
+
+    // Reversed bounds (min > max) across all 5 types in Parquet row-group statistics:
+    expectParquetColumnReset(
+        0,
+        [](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_min("z").set_max("a");
+        },
+        Predicate::Compare("key", CompareOp::Eq, std::string("m")));
+    expectParquetColumnReset(
+        2,
+        [](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_min(std::string("\x01", 1)).set_max(std::string("\x00", 1));
+        },
+        Predicate::Compare("flag", CompareOp::Eq, true));
+    expectParquetColumnReset(
+        3,
+        [&](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_min(makeBytesString(EncodeInt64(50))).set_max(makeBytesString(EncodeInt64(10)));
+        },
+        Predicate::Compare("count", CompareOp::Eq, int64_t{30}));
+    expectParquetColumnReset(
+        4,
+        [&](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_min(makeBytesString(EncodeDouble(9.0))).set_max(makeBytesString(EncodeDouble(1.0)));
+        },
+        Predicate::Compare("score", CompareOp::Eq, 5.0));
+    expectParquetColumnReset(
+        5,
+        [&](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_min(makeBytesString(EncodeInt64(900))).set_max(makeBytesString(EncodeInt64(100)));
+        },
+        Predicate::Compare("at", CompareOp::Eq, TimestampUs{500}));
+
+    // Invalid UTF-8 (0xC3), out-of-range timestamp, NaN/Inf, mismatched num_values, contradictory all_null_value,
+    // required column null_count > 0, and non-exact upper bound (`is_max_value_exact = false`):
+    expectParquetColumnReset(
         1,
-        {(*batchRes)->column(0),
-            (*batchRes)->column(1),
-            (*batchRes)->column(2),
-            (*batchRes)->column(3),
-            (*batchRes)->column(4),
-            badTsArray});
-    const auto badTable = arrow::Table::FromRecordBatches({badBatch}).ValueOrDie();
-    auto sink = arrow::io::BufferOutputStream::Create().ValueOrDie();
-    ASSERT_TRUE(parquet::arrow::WriteTable(*badTable, arrow::default_memory_pool(), sink, 16).ok());
-    const auto parquetBytes = sink->Finish().ValueOrDie();
-    auto parquetReader = parquet::ParquetFileReader::Open(std::make_shared<arrow::io::BufferReader>(parquetBytes));
-    const auto rg = parquetReader->metadata()->RowGroup(0);
-    const auto rgRes = ExtractRowGroupZoneStats(*rg, FullSchema, allFields);
-    ASSERT_FALSE(rgRes);
-    EXPECT_EQ(rgRes.error().code, "CORRUPTION") << rgRes.error().message;
+        [](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_min(std::string("\xC3", 1)).set_max("zzz");
+        },
+        Predicate::Compare("label", CompareOp::Eq, std::string("\xC3\xA9")));
+    expectParquetColumnReset(
+        1,
+        [](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_min("aaa").set_max(std::string("\xC3", 1));
+        },
+        Predicate::Compare("label", CompareOp::Eq, std::string("\xC3\xA9")));
+    expectParquetColumnReset(
+        5,
+        [&](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_max(makeBytesString(EncodeInt64(253402300800000000LL)));
+        },
+        Predicate::Compare("at", CompareOp::Gt, TimestampUs{500}));
+    expectParquetColumnReset(
+        4,
+        [&](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_min(makeBytesString(EncodeDouble(std::numeric_limits<double>::quiet_NaN())));
+        },
+        Predicate::Compare("score", CompareOp::Gt, 10.0));
+    expectParquetColumnReset(
+        3,
+        [](int64_t& numValues, parquet::EncodedStatistics&) {
+            numValues = 3; // != rowCount (4)
+        },
+        Predicate::Compare("count", CompareOp::Gt, int64_t{100}));
+    expectParquetColumnReset(
+        3,
+        [](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_null_count(4); // all-null row group with non-null min/max bounds present
+        },
+        Predicate::IsNotNull("count"));
+    expectParquetColumnReset(
+        3,
+        [](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_null_count(5); // null_count > rowCount
+        },
+        Predicate::IsNull("count"));
+    expectParquetColumnReset(
+        3,
+        [](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_null_count(-1);
+        },
+        Predicate::IsNull("count"));
+    expectParquetColumnReset(
+        0,
+        [](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.set_null_count(1); // required column -> even IS NULL must NOT prune
+        },
+        Predicate::IsNull("key"));
+    expectParquetColumnReset(
+        1,
+        [](int64_t&, parquet::EncodedStatistics& enc) {
+            enc.is_max_value_exact = false;
+            enc.is_min_value_exact = false;
+        },
+        Predicate::Compare("label", CompareOp::Gt, std::string("zzz")));
+
+    auto nanManifestFile = validFile;
+    nanManifestFile.nan_value_counts[5] = 1;
+    expectParquetColumnReset(
+        4,
+        [](int64_t&, parquet::EncodedStatistics&) {
+        },
+        Predicate::Compare("score", CompareOp::Gt, 10.0),
+        &nanManifestFile);
+    expectParquetColumnReset(
+        4,
+        [](int64_t&, parquet::EncodedStatistics&) {
+        },
+        Predicate::IsNull("score"),
+        &nanManifestFile);
 }
 
 } // namespace

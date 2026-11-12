@@ -12,6 +12,9 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace iceberg {
@@ -28,6 +31,52 @@ class ResourceReservation;
 } // namespace glamdb
 
 namespace glamdb::detail {
+
+void MaybeFailCacheAllocationForTesting();
+
+// Thread-local allocation counter and deterministic std::bad_alloc fault
+// injector for unit tests of TSnapshotMetadataCache.
+class TScopedCacheAllocInjector
+{
+public:
+    explicit TScopedCacheAllocInjector(size_t failOnCall, bool failAll = false) noexcept;
+    ~TScopedCacheAllocInjector();
+
+    TScopedCacheAllocInjector(const TScopedCacheAllocInjector&) = delete;
+    TScopedCacheAllocInjector& operator=(const TScopedCacheAllocInjector&) = delete;
+
+    static size_t AllocationCount() noexcept;
+};
+
+template <typename T>
+struct TCacheAllocator
+{
+    using value_type = T;
+    using is_always_equal = std::true_type;
+
+    constexpr TCacheAllocator() noexcept = default;
+
+    template <typename U>
+    constexpr TCacheAllocator(const TCacheAllocator<U>&) noexcept
+    { }
+
+    T* allocate(size_t count)
+    {
+        MaybeFailCacheAllocationForTesting();
+        return std::allocator<T>{}.allocate(count);
+    }
+
+    void deallocate(T* ptr, size_t count) noexcept
+    {
+        std::allocator<T>{}.deallocate(ptr, count);
+    }
+
+    template <typename U>
+    constexpr bool operator==(const TCacheAllocator<U>&) const noexcept
+    {
+        return true;
+    }
+};
 
 struct TSnapshotMetadataCacheOptions
 {
@@ -86,29 +135,118 @@ public:
     TSnapshotMetadataCacheStats Stats() const;
 
 private:
+    using TCacheString = std::basic_string<char, std::char_traits<char>, TCacheAllocator<char>>;
+
+    struct TCacheStringLess
+    {
+        using is_transparent = void;
+
+        template <typename TLhs, typename TRhs>
+        constexpr bool operator()(const TLhs& lhs, const TRhs& rhs) const noexcept
+        {
+            return std::string_view(lhs) < std::string_view(rhs);
+        }
+    };
+
     struct TRootKey
     {
-        std::string MetadataLocation;
+        TCacheString MetadataLocation;
         int64_t FileSize = 0;
+    };
 
-        auto operator<=>(const TRootKey&) const = default;
+    struct TRootKeyView
+    {
+        std::string_view MetadataLocation;
+        int64_t FileSize = 0;
+    };
+
+    struct TRootKeyLess
+    {
+        using is_transparent = void;
+
+        static constexpr std::tuple<std::string_view, int64_t> Project(const TRootKey& key) noexcept
+        {
+            return {std::string_view(key.MetadataLocation), key.FileSize};
+        }
+
+        static constexpr std::tuple<std::string_view, int64_t> Project(const TRootKeyView& key) noexcept
+        {
+            return {key.MetadataLocation, key.FileSize};
+        }
+
+        template <typename TLhs, typename TRhs>
+        constexpr bool operator()(const TLhs& lhs, const TRhs& rhs) const noexcept
+        {
+            return Project(lhs) < Project(rhs);
+        }
     };
 
     struct TManifestKey
     {
-        std::string ManifestPath;
+        TCacheString ManifestPath;
         int64_t ManifestLength = 0;
+    };
 
-        auto operator<=>(const TManifestKey&) const = default;
+    struct TManifestKeyView
+    {
+        std::string_view ManifestPath;
+        int64_t ManifestLength = 0;
+    };
+
+    struct TManifestKeyLess
+    {
+        using is_transparent = void;
+
+        static constexpr std::tuple<std::string_view, int64_t> Project(const TManifestKey& key) noexcept
+        {
+            return {std::string_view(key.ManifestPath), key.ManifestLength};
+        }
+
+        static constexpr std::tuple<std::string_view, int64_t> Project(const TManifestKeyView& key) noexcept
+        {
+            return {key.ManifestPath, key.ManifestLength};
+        }
+
+        template <typename TLhs, typename TRhs>
+        constexpr bool operator()(const TLhs& lhs, const TRhs& rhs) const noexcept
+        {
+            return Project(lhs) < Project(rhs);
+        }
     };
 
     struct TFooterKey
     {
-        std::string Path;
+        TCacheString Path;
         int64_t SizeBytes = 0;
         int64_t RecordCount = 0;
+    };
 
-        auto operator<=>(const TFooterKey&) const = default;
+    struct TFooterKeyView
+    {
+        std::string_view Path;
+        int64_t SizeBytes = 0;
+        int64_t RecordCount = 0;
+    };
+
+    struct TFooterKeyLess
+    {
+        using is_transparent = void;
+
+        static constexpr std::tuple<std::string_view, int64_t, int64_t> Project(const TFooterKey& key) noexcept
+        {
+            return {std::string_view(key.Path), key.SizeBytes, key.RecordCount};
+        }
+
+        static constexpr std::tuple<std::string_view, int64_t, int64_t> Project(const TFooterKeyView& key) noexcept
+        {
+            return {key.Path, key.SizeBytes, key.RecordCount};
+        }
+
+        template <typename TLhs, typename TRhs>
+        constexpr bool operator()(const TLhs& lhs, const TRhs& rhs) const noexcept
+        {
+            return Project(lhs) < Project(rhs);
+        }
     };
 
     template <typename TKey, typename TValue>
@@ -120,10 +258,17 @@ private:
         uint64_t Tick = 0;
     };
 
-    using TRootList = std::list<TLruEntry<TRootKey, const iceberg::TableMetadata>>;
-    using TManifestListList = std::list<TLruEntry<std::string, const TManifestListValue>>;
-    using TManifestEntriesList = std::list<TLruEntry<TManifestKey, const TManifestDataFilesValue>>;
-    using TFooterList = std::list<TLruEntry<TFooterKey, parquet::FileMetaData>>;
+    template <typename TKey, typename TValue>
+    using TCacheList = std::list<TLruEntry<TKey, TValue>, TCacheAllocator<TLruEntry<TKey, TValue>>>;
+
+    template <typename TKey, typename TList, typename TCompare>
+    using TCacheMap = std::
+        map<TKey, typename TList::iterator, TCompare, TCacheAllocator<std::pair<const TKey, typename TList::iterator>>>;
+
+    using TRootList = TCacheList<TRootKey, const iceberg::TableMetadata>;
+    using TManifestListList = TCacheList<TCacheString, const TManifestListValue>;
+    using TManifestEntriesList = TCacheList<TManifestKey, const TManifestDataFilesValue>;
+    using TFooterList = TCacheList<TFooterKey, parquet::FileMetaData>;
 
     const std::shared_ptr<ResourceReservation> Reservation_;
     const TSnapshotMetadataCacheOptions Options_;
@@ -136,16 +281,25 @@ private:
     uint64_t Evictions_ = 0;
 
     TRootList RootsLru_;
-    std::map<TRootKey, TRootList::iterator> Roots_;
+    TCacheMap<TRootKey, TRootList, TRootKeyLess> Roots_;
 
     TManifestListList ManifestListsLru_;
-    std::map<std::string, TManifestListList::iterator, std::less<>> ManifestLists_;
+    TCacheMap<TCacheString, TManifestListList, TCacheStringLess> ManifestLists_;
 
     TManifestEntriesList ManifestsLru_;
-    std::map<TManifestKey, TManifestEntriesList::iterator> Manifests_;
+    TCacheMap<TManifestKey, TManifestEntriesList, TManifestKeyLess> Manifests_;
 
     TFooterList FootersLru_;
-    std::map<TFooterKey, TFooterList::iterator> Footers_;
+    TCacheMap<TFooterKey, TFooterList, TFooterKeyLess> Footers_;
+
+    template <typename TKey, typename TKeyView, typename TValue, typename TList, typename TMap, typename TMakeKey>
+    void PutEntry(TKeyView keyView,
+        TMakeKey&& makeKey,
+        std::shared_ptr<TValue> value,
+        uint64_t charge,
+        size_t maxEntries,
+        TList& lru,
+        TMap& map);
 
     bool EvictOldestLocked();
     void MakeRoomForBytesLocked(uint64_t incomingBytes);

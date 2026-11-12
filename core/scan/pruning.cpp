@@ -6,7 +6,9 @@
 #include <iceberg/schema.h>
 #include <parquet/exception.h>
 #include <parquet/metadata.h>
+#include <parquet/schema.h>
 #include <parquet/statistics.h>
+#include <parquet/types.h>
 
 #include <algorithm>
 #include <array>
@@ -21,15 +23,9 @@ namespace {
 
 constexpr size_t MaxKeyBytes = 1024;
 constexpr size_t MaxStringBytes = 1U << 20;
+constexpr size_t DefaultIcebergStringTruncateCodePoints = 16;
 constexpr int64_t MinTimestampUs = -62135596800000000LL;
 constexpr int64_t MaxTimestampUs = 253402300799999999LL;
-
-ErrorDetail Corruption(std::string_view context, std::string_view message)
-{
-    return {"CORRUPTION",
-        BoundedDiagnostic(std::string(context) + ": " + std::string(message)),
-        RetryHint::OperatorAction};
-}
 
 ErrorDetail InternalError(std::string_view message)
 {
@@ -51,26 +47,53 @@ uint64_t ReadLittleEndian64(std::span<const uint8_t> bytes) noexcept
     return raw;
 }
 
-Result<Literal> DecodeBoundBytes(const FieldSpec& spec, std::span<const uint8_t> bytes, std::string_view context)
+size_t Utf8CodePoints(std::string_view text) noexcept
+{
+    size_t count = 0;
+    for (const char ch : text) {
+        if ((static_cast<uint8_t>(ch) & 0xC0U) != 0x80U) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+TColumnZoneStats MakeMalformedZoneStats(const FieldSpec& spec) noexcept
+{
+    // Nullable is forced true when statistics are malformed so even IS NULL on a
+    // required column with contradictory null_count cannot prune the zone.
+    return TColumnZoneStats{
+        .Type = spec.type,
+        .Nullable = true,
+        .HasStats = false,
+        .NullCount = std::nullopt,
+        .LowerBound = std::nullopt,
+        .UpperBound = std::nullopt,
+        .LowerExact = false,
+        .UpperExact = false,
+    };
+}
+
+std::optional<Literal> DecodeBoundOpt(const FieldSpec& spec, std::span<const uint8_t> bytes)
 {
     switch (spec.type) {
         case FieldType::String: {
             const auto maxBytes = spec.name == "key" ? MaxKeyBytes : MaxStringBytes;
             const std::string_view text(reinterpret_cast<const char*>(bytes.data()), bytes.size());
             if (text.size() > maxBytes || !ValidUtf8(text)) {
-                return std::unexpected(Corruption(context, "string bound violates canonical domain"));
+                return std::nullopt;
             }
             return Literal{std::string(text)};
         }
         case FieldType::Bool: {
             if (bytes.size() != 1 || (bytes[0] != 0 && bytes[0] != 1)) {
-                return std::unexpected(Corruption(context, "boolean bound has invalid byte encoding"));
+                return std::nullopt;
             }
             return Literal{bytes[0] != 0};
         }
         case FieldType::Int64: {
             if (bytes.size() != sizeof(int64_t)) {
-                return std::unexpected(Corruption(context, "int64 bound has invalid byte length"));
+                return std::nullopt;
             }
             const auto raw = ReadLittleEndian64(bytes);
             int64_t value = 0;
@@ -79,31 +102,31 @@ Result<Literal> DecodeBoundBytes(const FieldSpec& spec, std::span<const uint8_t>
         }
         case FieldType::Float64: {
             if (bytes.size() != sizeof(double)) {
-                return std::unexpected(Corruption(context, "float64 bound has invalid byte length"));
+                return std::nullopt;
             }
             const auto raw = ReadLittleEndian64(bytes);
             double value = 0.0;
             std::memcpy(&value, &raw, sizeof(value));
             if (!std::isfinite(value)) {
-                return std::unexpected(Corruption(context, "float64 bound is not finite"));
+                return std::nullopt;
             }
             // Parquet statistics write -0.0 as min when the minimum value is +0.0 (PARQUET-1222).
             return Literal{value == 0.0 ? 0.0 : value};
         }
         case FieldType::TimestampUsUtc: {
             if (bytes.size() != sizeof(int64_t)) {
-                return std::unexpected(Corruption(context, "timestamp bound has invalid byte length"));
+                return std::nullopt;
             }
             const auto raw = ReadLittleEndian64(bytes);
             int64_t micros = 0;
             std::memcpy(&micros, &raw, sizeof(micros));
             if (micros < MinTimestampUs || micros > MaxTimestampUs) {
-                return std::unexpected(Corruption(context, "timestamp bound is outside supported UTC range"));
+                return std::nullopt;
             }
             return Literal{TimestampUs{micros}};
         }
     }
-    return std::unexpected(InternalError("unsupported field type in zone statistics"));
+    return std::nullopt;
 }
 
 int CompareTyped(FieldType type, const Literal& lhs, const Literal& rhs)
@@ -139,29 +162,52 @@ int CompareTyped(FieldType type, const Literal& lhs, const Literal& rhs)
     return 0;
 }
 
-Status
-FinalizeColumnZoneStats(const FieldSpec& spec, int64_t rowCount, TColumnZoneStats& stats, std::string_view context)
+bool ValidateColumnZoneStats(const FieldSpec& spec, int64_t rowCount, const TColumnZoneStats& stats) noexcept
 {
     if (stats.NullCount.has_value()) {
         if (*stats.NullCount < 0 || *stats.NullCount > rowCount) {
-            return std::unexpected(Corruption(context, "null count is outside the zone row count"));
+            return false;
         }
         if (!spec.nullable && *stats.NullCount != 0) {
-            return std::unexpected(Corruption(context, "required column reports non-zero null count"));
+            return false;
         }
         if (*stats.NullCount == rowCount && (stats.LowerBound.has_value() || stats.UpperBound.has_value())) {
-            return std::unexpected(Corruption(context, "all-null column carries non-null bounds"));
+            return false;
         }
     }
     if (rowCount == 0 && (stats.LowerBound.has_value() || stats.UpperBound.has_value())) {
-        return std::unexpected(Corruption(context, "empty zone carries non-null bounds"));
+        return false;
     }
     if (stats.LowerBound.has_value() && stats.UpperBound.has_value()) {
         if (CompareTyped(spec.type, *stats.LowerBound, *stats.UpperBound) > 0) {
-            return std::unexpected(Corruption(context, "lower bound exceeds upper bound"));
+            return false;
         }
     }
-    return {};
+    return true;
+}
+
+bool MatchesParquetColumnOrder(FieldType type, const parquet::SchemaDescriptor* schema, int columnIndex) noexcept
+{
+    if (schema == nullptr || columnIndex < 0 || columnIndex >= schema->num_columns()) {
+        return false;
+    }
+    const auto* descr = schema->Column(columnIndex);
+    if (descr == nullptr) {
+        return false;
+    }
+    switch (type) {
+        case FieldType::String:
+            return descr->physical_type() == parquet::Type::BYTE_ARRAY &&
+                descr->sort_order() == parquet::SortOrder::UNSIGNED;
+        case FieldType::Bool:
+            return descr->physical_type() == parquet::Type::BOOLEAN;
+        case FieldType::Int64:
+        case FieldType::TimestampUsUtc:
+            return descr->physical_type() == parquet::Type::INT64 && descr->sort_order() == parquet::SortOrder::SIGNED;
+        case FieldType::Float64:
+            return descr->physical_type() == parquet::Type::DOUBLE && descr->sort_order() == parquet::SortOrder::SIGNED;
+    }
+    return false;
 }
 
 ETruthValue AndTruth(ETruthValue lhs, ETruthValue rhs) noexcept
@@ -439,20 +485,21 @@ Result<std::vector<TColumnZoneStats>> ExtractFileZoneStats(const iceberg::DataFi
     std::span<const size_t> readFields)
 {
     try {
-        constexpr std::string_view Context = "validate manifest column metrics";
-        if (dataFile.record_count <= 0) {
-            return std::unexpected(Corruption(Context, "manifest data file has non-positive record count"));
-        }
-        const auto icebergFields = icebergSchema.fields();
-        if (icebergFields.size() != schema.fields.size()) {
-            return std::unexpected(Corruption(Context, "manifest schema differs from collection schema"));
-        }
-        std::vector<TColumnZoneStats> out;
-        out.reserve(readFields.size());
         for (const auto fieldIndex : readFields) {
             if (fieldIndex >= schema.fields.size()) {
                 return std::unexpected(InternalError("read field index is out of range"));
             }
+        }
+        std::vector<TColumnZoneStats> out;
+        out.reserve(readFields.size());
+        const auto icebergFields = icebergSchema.fields();
+        if (dataFile.record_count <= 0 || icebergFields.size() != schema.fields.size()) {
+            for (const auto fieldIndex : readFields) {
+                out.push_back(MakeMalformedZoneStats(schema.fields[fieldIndex]));
+            }
+            return out;
+        }
+        for (const auto fieldIndex : readFields) {
             const auto& spec = schema.fields[fieldIndex];
             const auto fieldID = icebergFields[fieldIndex].field_id();
             TColumnZoneStats stats{
@@ -463,40 +510,60 @@ Result<std::vector<TColumnZoneStats>> ExtractFileZoneStats(const iceberg::DataFi
                 .UpperExact = spec.type != FieldType::String,
             };
 
+            bool malformed = false;
             if (const auto it = dataFile.value_counts.find(fieldID); it != dataFile.value_counts.end()) {
                 if (it->second != dataFile.record_count) {
-                    return std::unexpected(Corruption(Context, "manifest value count differs from record count"));
+                    malformed = true;
+                } else {
+                    stats.HasStats = true;
                 }
-                stats.HasStats = true;
             }
             if (const auto it = dataFile.null_value_counts.find(fieldID); it != dataFile.null_value_counts.end()) {
                 stats.NullCount = it->second;
                 stats.HasStats = true;
             }
+            bool floatsWithoutNaN = false;
             if (const auto it = dataFile.nan_value_counts.find(fieldID); it != dataFile.nan_value_counts.end()) {
                 if (it->second != 0) {
-                    return std::unexpected(Corruption(Context, "manifest reports non-zero NaN count"));
+                    malformed = true;
+                } else {
+                    floatsWithoutNaN = true;
                 }
             }
             if (const auto it = dataFile.lower_bounds.find(fieldID); it != dataFile.lower_bounds.end()) {
-                auto decoded = DecodeBoundBytes(spec, it->second, Context);
+                auto decoded = DecodeBoundOpt(spec, it->second);
                 if (!decoded) {
-                    return std::unexpected(std::move(decoded.error()));
+                    malformed = true;
+                } else {
+                    stats.LowerBound = std::move(*decoded);
+                    stats.HasStats = true;
                 }
-                stats.LowerBound = std::move(*decoded);
-                stats.HasStats = true;
             }
             if (const auto it = dataFile.upper_bounds.find(fieldID); it != dataFile.upper_bounds.end()) {
-                auto decoded = DecodeBoundBytes(spec, it->second, Context);
+                auto decoded = DecodeBoundOpt(spec, it->second);
                 if (!decoded) {
-                    return std::unexpected(std::move(decoded.error()));
+                    malformed = true;
+                } else {
+                    stats.UpperBound = std::move(*decoded);
+                    stats.HasStats = true;
                 }
-                stats.UpperBound = std::move(*decoded);
-                stats.HasStats = true;
             }
 
-            if (auto valid = FinalizeColumnZoneStats(spec, dataFile.record_count, stats, Context); !valid) {
-                return std::unexpected(std::move(valid.error()));
+            if (malformed || !ValidateColumnZoneStats(spec, dataFile.record_count, stats)) {
+                out.push_back(MakeMalformedZoneStats(spec));
+                continue;
+            }
+            if (spec.type == FieldType::Float64 && !floatsWithoutNaN) {
+                stats.LowerBound.reset();
+                stats.UpperBound.reset();
+            }
+            // Non-key strings use write.metadata.metrics.default = truncate(16). Drop upper bounds
+            // with >= 16 UTF-8 code points in case a writer truncated the prefix without incrementing;
+            // exact Parquet row-group bounds still prune after opening the file.
+            if (spec.type == FieldType::String && spec.name != "key" && stats.UpperBound.has_value() &&
+                Utf8CodePoints(std::get<std::string>(*stats.UpperBound)) >= DefaultIcebergStringTruncateCodePoints)
+            {
+                stats.UpperBound.reset();
             }
             out.push_back(std::move(stats));
         }
@@ -504,87 +571,134 @@ Result<std::vector<TColumnZoneStats>> ExtractFileZoneStats(const iceberg::DataFi
     } catch (const std::bad_alloc& error) {
         return std::unexpected(ResourceExhausted(error.what()));
     } catch (const std::exception& error) {
-        return std::unexpected(Corruption("validate manifest column metrics", error.what()));
+        return std::unexpected(InternalError(error.what()));
     }
 }
 
 Result<std::vector<TColumnZoneStats>> ExtractRowGroupZoneStats(const parquet::RowGroupMetaData& group,
     const SchemaSpec& schema,
-    std::span<const size_t> readFields)
+    std::span<const size_t> readFields,
+    const iceberg::DataFile* dataFile,
+    const iceberg::Schema* icebergSchema)
 {
     try {
-        constexpr std::string_view Context = "validate Parquet row-group statistics";
-        const auto rowCount = group.num_rows();
-        if (rowCount < 0 || group.num_columns() != static_cast<int>(schema.fields.size())) {
-            return std::unexpected(Corruption(Context, "row group shape does not match collection schema"));
-        }
-        std::vector<TColumnZoneStats> out;
-        out.reserve(readFields.size());
         for (const auto fieldIndex : readFields) {
             if (fieldIndex >= schema.fields.size()) {
                 return std::unexpected(InternalError("read field index is out of range"));
             }
+        }
+        std::vector<TColumnZoneStats> out;
+        out.reserve(readFields.size());
+        const auto rowCount = group.num_rows();
+        if (rowCount < 0 || group.num_columns() != static_cast<int>(schema.fields.size())) {
+            for (const auto fieldIndex : readFields) {
+                out.push_back(MakeMalformedZoneStats(schema.fields[fieldIndex]));
+            }
+            return out;
+        }
+        for (const auto fieldIndex : readFields) {
             const auto& spec = schema.fields[fieldIndex];
-            const auto chunk = group.ColumnChunk(static_cast<int>(fieldIndex));
-            if (!chunk || chunk->num_values() != rowCount) {
-                return std::unexpected(Corruption(Context, "column chunk value count differs from row group"));
-            }
+            try {
+                if (!MatchesParquetColumnOrder(spec.type, group.schema(), static_cast<int>(fieldIndex))) {
+                    out.push_back(MakeMalformedZoneStats(spec));
+                    continue;
+                }
+                const auto chunk = group.ColumnChunk(static_cast<int>(fieldIndex));
+                if (!chunk || chunk->num_values() != rowCount) {
+                    out.push_back(MakeMalformedZoneStats(spec));
+                    continue;
+                }
 
-            TColumnZoneStats stats{
-                .Type = spec.type,
-                .Nullable = spec.nullable,
-                .LowerExact = true,
-                .UpperExact = true,
-            };
+                bool malformed = false;
+                bool floatsWithoutNaN = false;
+                if (spec.type == FieldType::Float64 && dataFile != nullptr && icebergSchema != nullptr) {
+                    const auto icebergFields = icebergSchema->fields();
+                    if (fieldIndex < icebergFields.size()) {
+                        const auto fieldID = icebergFields[fieldIndex].field_id();
+                        if (const auto nanIt = dataFile->nan_value_counts.find(fieldID);
+                            nanIt != dataFile->nan_value_counts.end())
+                        {
+                            if (nanIt->second != 0) {
+                                malformed = true;
+                            } else {
+                                floatsWithoutNaN = true;
+                            }
+                        }
+                    }
+                }
 
-            if (const auto encoded = chunk->encoded_statistics()) {
-                if (encoded->has_null_count) {
-                    stats.NullCount = encoded->null_count;
-                    stats.HasStats = true;
-                }
-                if (encoded->all_null_value) {
-                    if (encoded->has_null_count && encoded->null_count != rowCount) {
-                        return std::unexpected(Corruption(Context, "all_null_value contradicts null_count"));
-                    }
-                    stats.NullCount = rowCount;
-                    stats.HasStats = true;
-                }
-                if (encoded->has_min) {
-                    const std::span<const uint8_t> minBytes(reinterpret_cast<const uint8_t*>(encoded->min().data()),
-                        encoded->min().size());
-                    auto decoded = DecodeBoundBytes(spec, minBytes, Context);
-                    if (!decoded) {
-                        return std::unexpected(std::move(decoded.error()));
-                    }
-                    stats.LowerBound = std::move(*decoded);
-                    stats.LowerExact = !encoded->is_min_value_exact.has_value() || *encoded->is_min_value_exact;
-                    stats.HasStats = true;
-                }
-                if (encoded->has_max) {
-                    const std::span<const uint8_t> maxBytes(reinterpret_cast<const uint8_t*>(encoded->max().data()),
-                        encoded->max().size());
-                    auto decoded = DecodeBoundBytes(spec, maxBytes, Context);
-                    if (!decoded) {
-                        return std::unexpected(std::move(decoded.error()));
-                    }
-                    stats.UpperBound = std::move(*decoded);
-                    stats.UpperExact = !encoded->is_max_value_exact.has_value() || *encoded->is_max_value_exact;
-                    stats.HasStats = true;
-                }
-            }
+                TColumnZoneStats stats{
+                    .Type = spec.type,
+                    .Nullable = spec.nullable,
+                    .LowerExact = true,
+                    .UpperExact = true,
+                };
 
-            if (auto valid = FinalizeColumnZoneStats(spec, rowCount, stats, Context); !valid) {
-                return std::unexpected(std::move(valid.error()));
+                if (const auto encoded = chunk->encoded_statistics()) {
+                    if (encoded->has_null_count) {
+                        stats.NullCount = encoded->null_count;
+                        stats.HasStats = true;
+                    }
+                    if (encoded->all_null_value) {
+                        if (encoded->has_null_count && encoded->null_count != rowCount) {
+                            malformed = true;
+                        } else {
+                            stats.NullCount = rowCount;
+                            stats.HasStats = true;
+                        }
+                    }
+                    if (encoded->has_min) {
+                        const std::span<const uint8_t> minBytes(reinterpret_cast<const uint8_t*>(encoded->min().data()),
+                            encoded->min().size());
+                        auto decoded = DecodeBoundOpt(spec, minBytes);
+                        if (!decoded) {
+                            malformed = true;
+                        } else {
+                            stats.LowerBound = std::move(*decoded);
+                            stats.LowerExact = !encoded->is_min_value_exact.has_value() || *encoded->is_min_value_exact;
+                            stats.HasStats = true;
+                        }
+                    }
+                    if (encoded->has_max) {
+                        const std::span<const uint8_t> maxBytes(reinterpret_cast<const uint8_t*>(encoded->max().data()),
+                            encoded->max().size());
+                        auto decoded = DecodeBoundOpt(spec, maxBytes);
+                        if (!decoded) {
+                            malformed = true;
+                        } else {
+                            stats.UpperBound = std::move(*decoded);
+                            stats.UpperExact = !encoded->is_max_value_exact.has_value() || *encoded->is_max_value_exact;
+                            stats.HasStats = true;
+                        }
+                    }
+                }
+
+                if (malformed || !ValidateColumnZoneStats(spec, rowCount, stats)) {
+                    out.push_back(MakeMalformedZoneStats(spec));
+                    continue;
+                }
+                if (!stats.LowerExact) {
+                    stats.LowerBound.reset();
+                }
+                if (!stats.UpperExact) {
+                    stats.UpperBound.reset();
+                }
+                if (spec.type == FieldType::Float64 && !floatsWithoutNaN) {
+                    stats.LowerBound.reset();
+                    stats.UpperBound.reset();
+                }
+                out.push_back(std::move(stats));
+            } catch (const std::bad_alloc&) {
+                throw;
+            } catch (const std::exception&) {
+                out.push_back(MakeMalformedZoneStats(spec));
             }
-            out.push_back(std::move(stats));
         }
         return out;
-    } catch (const parquet::ParquetException& error) {
-        return std::unexpected(Corruption("validate Parquet row-group statistics", error.what()));
     } catch (const std::bad_alloc& error) {
         return std::unexpected(ResourceExhausted(error.what()));
     } catch (const std::exception& error) {
-        return std::unexpected(Corruption("validate Parquet row-group statistics", error.what()));
+        return std::unexpected(InternalError(error.what()));
     }
 }
 
@@ -694,6 +808,9 @@ Result<bool> CanPruneZone(const TBoundPredicate& predicate,
     std::span<const size_t> readFields,
     std::span<const TColumnZoneStats> readStats)
 {
+    if (readFields.size() != readStats.size() || !std::ranges::is_sorted(readFields) || predicate.Ops.empty()) {
+        return std::unexpected(InternalError("invalid zone predicate inputs"));
+    }
     if (predicate.IsAlwaysTrue()) {
         return false;
     }

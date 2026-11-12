@@ -31,13 +31,22 @@ if(NOT GLAMDB_IO_ONLY)
     set_tests_properties(glamdb.smoke PROPERTIES LABELS "smoke" TIMEOUT 10)
 
     file(GLOB_RECURSE unit_test_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/unit/*.cpp")
-    list(FILTER unit_test_sources EXCLUDE REGEX "/unit/(io|storage)/|/unit/core_test\\.cpp$")
+    list(FILTER unit_test_sources EXCLUDE REGEX "/unit/(io|storage)/|/unit/(core_test|metadata_cache_oom_test)\\.cpp$")
     add_executable(glamdb_unit ${unit_test_sources} support/fake_storage.cpp)
     target_link_libraries(glamdb_unit PRIVATE glamdb::core GTest::gtest_main glamdb_build_options
         SQLite::SQLite3 iceberg::iceberg_sql_catalog_static Arrow::arrow_static glamdb_json)
     target_include_directories(glamdb_unit PRIVATE "${PROJECT_SOURCE_DIR}")
     target_compile_definitions(glamdb_unit PRIVATE "GLAMDB_TEST_STORAGE=$<BOOL:${GLAMDB_BUILD_STORAGE}>")
     gtest_discover_tests(glamdb_unit TEST_PREFIX glamdb.unit. PROPERTIES LABELS unit TIMEOUT 30)
+
+    if(GLAMDB_BUILD_STORAGE)
+        add_executable(glamdb_metadata_cache_oom unit/metadata_cache_oom_test.cpp)
+        target_link_libraries(glamdb_metadata_cache_oom PRIVATE glamdb::core glamdb_storage GTest::gtest_main
+            glamdb_build_options Arrow::arrow_static)
+        target_include_directories(glamdb_metadata_cache_oom PRIVATE "${PROJECT_SOURCE_DIR}")
+        target_compile_definitions(glamdb_metadata_cache_oom PRIVATE "GLAMDB_TEST_STORAGE=1")
+        gtest_discover_tests(glamdb_metadata_cache_oom TEST_PREFIX glamdb.unit. PROPERTIES LABELS unit TIMEOUT 30)
+    endif()
 
     if(GLAMDB_BUILD_STORAGE)
         # Planner, cursor and storage error classification over an in-memory
@@ -75,6 +84,11 @@ if(NOT GLAMDB_IO_ONLY)
         add_executable(glamdb_parquet_settings_bench "${PROJECT_SOURCE_DIR}/benchmarks/parquet_settings.cpp")
         target_include_directories(glamdb_parquet_settings_bench PRIVATE "${PROJECT_SOURCE_DIR}")
         target_link_libraries(glamdb_parquet_settings_bench PRIVATE glamdb::core glamdb_build_options Arrow::arrow_static)
+
+        add_executable(glamdb_scan_data_reads_bench
+            "${PROJECT_SOURCE_DIR}/benchmarks/scan_data_reads.cpp" support/fault_fs.cpp)
+        target_include_directories(glamdb_scan_data_reads_bench PRIVATE "${PROJECT_SOURCE_DIR}")
+        target_link_libraries(glamdb_scan_data_reads_bench PRIVATE glamdb::core glamdb_storage glamdb_build_options)
     endif()
 
     file(GLOB_RECURSE fault_test_sources CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/fault/*.cpp")

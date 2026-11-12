@@ -9,10 +9,21 @@
 
 #include <algorithm>
 #include <limits>
+#include <new>
 #include <utility>
 
 namespace glamdb::detail {
 namespace {
+
+struct TThreadAllocFaultState
+{
+    bool Active = false;
+    bool FailAll = false;
+    size_t Calls = 0;
+    size_t FailOnCall = 0;
+};
+
+thread_local TThreadAllocFaultState TlsAllocFaultState{};
 
 uint64_t AddClamped(uint64_t lhs, uint64_t rhs) noexcept
 {
@@ -108,11 +119,92 @@ uint64_t EstimateFooterBytes(std::string_view path, const parquet::FileMetaData&
 
 } // namespace
 
+void MaybeFailCacheAllocationForTesting()
+{
+    if (!TlsAllocFaultState.Active) {
+        return;
+    }
+    ++TlsAllocFaultState.Calls;
+    if (TlsAllocFaultState.FailAll ||
+        (TlsAllocFaultState.FailOnCall > 0 && TlsAllocFaultState.Calls == TlsAllocFaultState.FailOnCall))
+    {
+        throw std::bad_alloc{};
+    }
+}
+
+TScopedCacheAllocInjector::TScopedCacheAllocInjector(size_t failOnCall, bool failAll) noexcept
+{
+    TlsAllocFaultState = TThreadAllocFaultState{
+        .Active = true,
+        .FailAll = failAll,
+        .Calls = 0,
+        .FailOnCall = failOnCall,
+    };
+}
+
+TScopedCacheAllocInjector::~TScopedCacheAllocInjector()
+{
+    TlsAllocFaultState = TThreadAllocFaultState{};
+}
+
+size_t TScopedCacheAllocInjector::AllocationCount() noexcept
+{
+    return TlsAllocFaultState.Calls;
+}
+
 TSnapshotMetadataCache::TSnapshotMetadataCache(std::shared_ptr<ResourceReservation> reservation,
     TSnapshotMetadataCacheOptions options)
     : Reservation_(std::move(reservation))
     , Options_(options)
 { }
+
+template <typename TKey, typename TKeyView, typename TValue, typename TList, typename TMap, typename TMakeKey>
+void TSnapshotMetadataCache::PutEntry(TKeyView keyView,
+    TMakeKey&& makeKey,
+    std::shared_ptr<TValue> value,
+    uint64_t charge,
+    size_t maxEntries,
+    TList& lru,
+    TMap& map)
+{
+    if (Options_.MaxBytes == 0 || maxEntries == 0 || charge > Options_.MaxBytes) {
+        return;
+    }
+
+    // Stage all dynamic allocations (both keys, the LRU list node, and the
+    // RB-tree map node) before acquiring Mutex_ or mutating any cache member.
+    // If std::bad_alloc is thrown at any step, the cache remains untouched.
+    TKey mapKey = makeKey();
+    TKey listKey = mapKey;
+    TList stagedList;
+    stagedList.push_back(TLruEntry<TKey, TValue>{std::move(listKey), std::move(value), charge, 0});
+    TMap stagedMap;
+    stagedMap.emplace(std::move(mapKey), stagedList.begin());
+    auto mapNode = stagedMap.extract(stagedMap.begin());
+
+    std::lock_guard lock(Mutex_);
+    if (const auto existing = map.find(keyView); existing != map.end()) {
+        UsedBytes_ -= existing->second->Bytes;
+        lru.erase(existing->second);
+        map.erase(existing);
+    }
+    while (map.size() >= maxEntries) {
+        UsedBytes_ -= lru.back().Bytes;
+        map.erase(lru.back().Key);
+        lru.pop_back();
+        ++Evictions_;
+    }
+    MakeRoomForBytesLocked(charge);
+    if (UsedBytes_ > Options_.MaxBytes - charge) {
+        return;
+    }
+
+    stagedList.front().Tick = ++Tick_;
+    lru.splice(lru.begin(), stagedList);
+    auto inserted = map.insert(std::move(mapNode));
+    inserted.position->second = lru.begin();
+    UsedBytes_ += charge;
+}
 
 bool TSnapshotMetadataCache::EvictOldestLocked()
 {
@@ -178,8 +270,7 @@ std::shared_ptr<const iceberg::TableMetadata> TSnapshotMetadataCache::FindRoot(s
     int64_t fileSize)
 {
     std::lock_guard lock(Mutex_);
-    const TRootKey key{std::string(metadataLocation), fileSize};
-    const auto it = Roots_.find(key);
+    const auto it = Roots_.find(TRootKeyView{metadataLocation, fileSize});
     if (it == Roots_.end()) {
         ++Misses_;
         return nullptr;
@@ -198,36 +289,23 @@ void TSnapshotMetadataCache::PutRoot(std::string_view metadataLocation,
         return;
     }
     const uint64_t charge = EstimateRootBytes(metadataLocation, fileSize, *metadata);
-    std::lock_guard lock(Mutex_);
-    if (Options_.MaxBytes == 0 || Options_.MaxRoots == 0 || charge > Options_.MaxBytes) {
-        return;
-    }
-    TRootKey key{std::string(metadataLocation), fileSize};
-    if (const auto existing = Roots_.find(key); existing != Roots_.end()) {
-        UsedBytes_ -= existing->second->Bytes;
-        RootsLru_.erase(existing->second);
-        Roots_.erase(existing);
-    }
-    while (Roots_.size() >= Options_.MaxRoots) {
-        UsedBytes_ -= RootsLru_.back().Bytes;
-        Roots_.erase(RootsLru_.back().Key);
-        RootsLru_.pop_back();
-        ++Evictions_;
-    }
-    MakeRoomForBytesLocked(charge);
-    if (UsedBytes_ > Options_.MaxBytes - charge) {
-        return;
-    }
-    RootsLru_.push_front({key, std::move(metadata), charge, ++Tick_});
-    Roots_[std::move(key)] = RootsLru_.begin();
-    UsedBytes_ += charge;
+    PutEntry<TRootKey>(
+        TRootKeyView{metadataLocation, fileSize},
+        [&] {
+            return TRootKey{TCacheString(metadataLocation), fileSize};
+        },
+        std::move(metadata),
+        charge,
+        Options_.MaxRoots,
+        RootsLru_,
+        Roots_);
 }
 
 void TSnapshotMetadataCache::EvictRoot(std::string_view metadataLocation)
 {
     std::lock_guard lock(Mutex_);
-    auto it = Roots_.lower_bound(TRootKey{std::string(metadataLocation), std::numeric_limits<int64_t>::min()});
-    while (it != Roots_.end() && it->first.MetadataLocation == metadataLocation) {
+    auto it = Roots_.lower_bound(TRootKeyView{metadataLocation, std::numeric_limits<int64_t>::min()});
+    while (it != Roots_.end() && std::string_view(it->first.MetadataLocation) == metadataLocation) {
         UsedBytes_ -= it->second->Bytes;
         RootsLru_.erase(it->second);
         it = Roots_.erase(it);
@@ -257,37 +335,23 @@ void TSnapshotMetadataCache::PutManifestList(std::string_view manifestListPath,
         return;
     }
     const uint64_t charge = EstimateManifestListBytes(manifestListPath, *manifests);
-    std::lock_guard lock(Mutex_);
-    if (Options_.MaxBytes == 0 || Options_.MaxManifestLists == 0 || charge > Options_.MaxBytes) {
-        return;
-    }
-    std::string key(manifestListPath);
-    if (const auto existing = ManifestLists_.find(key); existing != ManifestLists_.end()) {
-        UsedBytes_ -= existing->second->Bytes;
-        ManifestListsLru_.erase(existing->second);
-        ManifestLists_.erase(existing);
-    }
-    while (ManifestLists_.size() >= Options_.MaxManifestLists) {
-        UsedBytes_ -= ManifestListsLru_.back().Bytes;
-        ManifestLists_.erase(ManifestListsLru_.back().Key);
-        ManifestListsLru_.pop_back();
-        ++Evictions_;
-    }
-    MakeRoomForBytesLocked(charge);
-    if (UsedBytes_ > Options_.MaxBytes - charge) {
-        return;
-    }
-    ManifestListsLru_.push_front({key, std::move(manifests), charge, ++Tick_});
-    ManifestLists_[std::move(key)] = ManifestListsLru_.begin();
-    UsedBytes_ += charge;
+    PutEntry<TCacheString>(
+        manifestListPath,
+        [&] {
+            return TCacheString(manifestListPath);
+        },
+        std::move(manifests),
+        charge,
+        Options_.MaxManifestLists,
+        ManifestListsLru_,
+        ManifestLists_);
 }
 
 std::shared_ptr<const TSnapshotMetadataCache::TManifestDataFilesValue>
 TSnapshotMetadataCache::FindManifest(std::string_view manifestPath, int64_t manifestLength)
 {
     std::lock_guard lock(Mutex_);
-    const TManifestKey key{std::string(manifestPath), manifestLength};
-    const auto it = Manifests_.find(key);
+    const auto it = Manifests_.find(TManifestKeyView{manifestPath, manifestLength});
     if (it == Manifests_.end()) {
         ++Misses_;
         return nullptr;
@@ -306,37 +370,23 @@ void TSnapshotMetadataCache::PutManifest(std::string_view manifestPath,
         return;
     }
     const uint64_t charge = EstimateManifestBytes(manifestPath, *files);
-    std::lock_guard lock(Mutex_);
-    if (Options_.MaxBytes == 0 || Options_.MaxManifests == 0 || charge > Options_.MaxBytes) {
-        return;
-    }
-    TManifestKey key{std::string(manifestPath), manifestLength};
-    if (const auto existing = Manifests_.find(key); existing != Manifests_.end()) {
-        UsedBytes_ -= existing->second->Bytes;
-        ManifestsLru_.erase(existing->second);
-        Manifests_.erase(existing);
-    }
-    while (Manifests_.size() >= Options_.MaxManifests) {
-        UsedBytes_ -= ManifestsLru_.back().Bytes;
-        Manifests_.erase(ManifestsLru_.back().Key);
-        ManifestsLru_.pop_back();
-        ++Evictions_;
-    }
-    MakeRoomForBytesLocked(charge);
-    if (UsedBytes_ > Options_.MaxBytes - charge) {
-        return;
-    }
-    ManifestsLru_.push_front({key, std::move(files), charge, ++Tick_});
-    Manifests_[std::move(key)] = ManifestsLru_.begin();
-    UsedBytes_ += charge;
+    PutEntry<TManifestKey>(
+        TManifestKeyView{manifestPath, manifestLength},
+        [&] {
+            return TManifestKey{TCacheString(manifestPath), manifestLength};
+        },
+        std::move(files),
+        charge,
+        Options_.MaxManifests,
+        ManifestsLru_,
+        Manifests_);
 }
 
 std::shared_ptr<parquet::FileMetaData>
 TSnapshotMetadataCache::FindFooter(std::string_view path, int64_t sizeBytes, int64_t recordCount)
 {
     std::lock_guard lock(Mutex_);
-    const TFooterKey key{std::string(path), sizeBytes, recordCount};
-    const auto it = Footers_.find(key);
+    const auto it = Footers_.find(TFooterKeyView{path, sizeBytes, recordCount});
     if (it == Footers_.end()) {
         ++Misses_;
         return nullptr;
@@ -356,29 +406,16 @@ void TSnapshotMetadataCache::PutFooter(std::string_view path,
         return;
     }
     const uint64_t charge = EstimateFooterBytes(path, *footer);
-    std::lock_guard lock(Mutex_);
-    if (Options_.MaxBytes == 0 || Options_.MaxFooters == 0 || charge > Options_.MaxBytes) {
-        return;
-    }
-    TFooterKey key{std::string(path), sizeBytes, recordCount};
-    if (const auto existing = Footers_.find(key); existing != Footers_.end()) {
-        UsedBytes_ -= existing->second->Bytes;
-        FootersLru_.erase(existing->second);
-        Footers_.erase(existing);
-    }
-    while (Footers_.size() >= Options_.MaxFooters) {
-        UsedBytes_ -= FootersLru_.back().Bytes;
-        Footers_.erase(FootersLru_.back().Key);
-        FootersLru_.pop_back();
-        ++Evictions_;
-    }
-    MakeRoomForBytesLocked(charge);
-    if (UsedBytes_ > Options_.MaxBytes - charge) {
-        return;
-    }
-    FootersLru_.push_front({key, std::move(footer), charge, ++Tick_});
-    Footers_[std::move(key)] = FootersLru_.begin();
-    UsedBytes_ += charge;
+    PutEntry<TFooterKey>(
+        TFooterKeyView{path, sizeBytes, recordCount},
+        [&] {
+            return TFooterKey{TCacheString(path), sizeBytes, recordCount};
+        },
+        std::move(footer),
+        charge,
+        Options_.MaxFooters,
+        FootersLru_,
+        Footers_);
 }
 
 void TSnapshotMetadataCache::Clear()

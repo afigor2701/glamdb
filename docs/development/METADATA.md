@@ -132,8 +132,9 @@ fetch only the header/footer (on a footer cache miss) and the column chunks of
 surviving row groups for `projection ∪ predicate` (zero-column unfiltered scans
 read no column chunks).
 
-Profile counters count successfully decoded manifests, opened Parquet files that
-yielded at least one surviving row group (`data_files_read`), actual positional
+Profile counters count successfully decoded manifests, opened Parquet files whose
+footer was verified (`data_files_read`, including files whose row groups were all
+pruned), actual positional
 Parquet `pread` bytes (`data_bytes_read`, excluding cached footers, metadata,
 failed reads after the failing syscall and OS page-cache hits), decoded rows
 before filtering/limit, and rows returned after filtering/limit. `Complete` means

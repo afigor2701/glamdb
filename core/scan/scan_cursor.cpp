@@ -595,6 +595,12 @@ private:
                 return produced;
             }
         }
+        // Normal completion (either all files were read or Remaining_ reached 0
+        // inside an open file) closes the open stream through the checked path so
+        // close errors surface instead of returning EOS. Cancellation is checked
+        // first so cancelled scans still clean up best-effort via Release().
+        CheckActive();
+        FinishFile();
         Release();
         CheckActive();
         LimitStopped_ = Remaining_ && *Remaining_ == 0;
@@ -639,7 +645,11 @@ private:
                 group = verifiedFooter->RowGroup(ordinal);
             });
             const auto groupRows = group->num_rows();
-            const auto groupStats = Take(ExtractRowGroupZoneStats(*group, Context_.Collection.schema, ReadFields_));
+            const auto groupStats = Take(ExtractRowGroupZoneStats(*group,
+                Context_.Collection.schema,
+                ReadFields_,
+                file.DataFile.get(),
+                FileSchema_.get()));
             if (groupRows == 0) {
                 continue;
             }

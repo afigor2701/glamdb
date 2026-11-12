@@ -246,6 +246,154 @@ TEST(SnapshotMetadataCacheUnitTest, DisabledZeroByteCacheEvictRootClearAndThread
     EXPECT_EQ(owner->GetUsage().memory_bytes[1], 0U);
 }
 
+TEST(SnapshotMetadataCacheUnitTest, StrongExceptionSafetyOnBadAllocAndZeroAllocLookups)
+{
+    const auto r1 = MakeDummyRoot("store://s/warehouse/c/metadata/00001-a.metadata.json");
+    const auto r2 = MakeDummyRoot("store://s/warehouse/c/metadata/00002-b.metadata.json");
+    const auto emptyMl = std::make_shared<const TSnapshotMetadataCache::TManifestListValue>();
+    const auto emptyManifest = std::make_shared<const TSnapshotMetadataCache::TManifestDataFilesValue>();
+    const auto footer = MakeDummyFooter();
+
+    // 1. Exact reproducer from PR #142 review: 600-char key with tight MaxBytes = 1024
+    //    for PutManifestList and PutManifest, plus tight caps for PutRoot and PutFooter.
+    const std::string longPrefix(600, 'x');
+
+    // Verify PutManifestList across every allocation step 1..N (both short and 600-char keys).
+    for (const std::string& base : {std::string("s"), longPrefix}) {
+        size_t allocSteps = 0;
+        {
+            TSnapshotMetadataCache probe({}, TSnapshotMetadataCacheOptions{.MaxBytes = 1024});
+            TScopedCacheAllocInjector counter(/*failOnCall=*/0);
+            probe.PutManifestList(base + "-0", emptyMl);
+            allocSteps = TScopedCacheAllocInjector::AllocationCount();
+        }
+        ASSERT_GE(allocSteps, 2U);
+        if (base.size() >= 600) {
+            EXPECT_EQ(allocSteps, 4U);
+        }
+
+        TSnapshotMetadataCache cache({}, TSnapshotMetadataCacheOptions{.MaxBytes = 1024, .MaxManifestLists = 3});
+        for (size_t step = 1; step <= allocSteps; ++step) {
+            TScopedCacheAllocInjector fail(step);
+            EXPECT_THROW(cache.PutManifestList(base + "-fail-" + std::to_string(step), emptyMl), std::bad_alloc);
+            EXPECT_EQ(cache.Stats().UsedBytes, 0U);
+            EXPECT_EQ(cache.Stats().ManifestListEntries, 0U);
+        }
+
+        // Insert a live entry, then fail an overwrite AND fail a new insertion at every step,
+        // then insert 8 keys forcing evictions: UsedBytes must never underflow or exceed MaxBytes!
+        cache.PutManifestList(base + "-keep", emptyMl);
+        const auto seededStats = cache.Stats();
+        ASSERT_GT(seededStats.UsedBytes, 0U);
+        ASSERT_LE(seededStats.UsedBytes, 1024U);
+
+        for (size_t step = 1; step <= allocSteps; ++step) {
+            {
+                TScopedCacheAllocInjector failOverwrite(step);
+                EXPECT_THROW(cache.PutManifestList(base + "-keep", emptyMl), std::bad_alloc);
+            }
+            EXPECT_EQ(cache.Stats().UsedBytes, seededStats.UsedBytes);
+            EXPECT_EQ(cache.Stats().ManifestListEntries, 1U);
+            EXPECT_EQ(cache.FindManifestList(base + "-keep"), emptyMl);
+
+            {
+                TScopedCacheAllocInjector failNew(step);
+                EXPECT_THROW(cache.PutManifestList(base + "-other-" + std::to_string(step), emptyMl), std::bad_alloc);
+            }
+            EXPECT_EQ(cache.Stats().UsedBytes, seededStats.UsedBytes);
+            EXPECT_EQ(cache.Stats().ManifestListEntries, 1U);
+        }
+
+        for (int i = 0; i < 8; ++i) {
+            cache.PutManifestList(base + "-ok-" + std::to_string(i), emptyMl);
+            const auto st = cache.Stats();
+            EXPECT_LE(st.UsedBytes, st.MaxBytes);
+            EXPECT_LE(st.ManifestListEntries, 3U);
+        }
+    }
+
+    // 2. Same transactional rollback check for PutManifest (MaxBytes = 1024, 600-char key),
+    //    PutRoot (MaxBytes = 4096, 600-char key), and PutFooter (MaxBytes = 4096, 600-char key).
+    {
+        TSnapshotMetadataCache cache({}, TSnapshotMetadataCacheOptions{.MaxBytes = 1024, .MaxManifests = 3});
+        for (size_t step = 1; step <= 4; ++step) {
+            TScopedCacheAllocInjector fail(step);
+            EXPECT_THROW(cache.PutManifest(longPrefix + "-m", 64, emptyManifest), std::bad_alloc);
+            EXPECT_EQ(cache.Stats().UsedBytes, 0U);
+            EXPECT_EQ(cache.Stats().ManifestEntries, 0U);
+        }
+        for (int i = 0; i < 8; ++i) {
+            cache.PutManifest(longPrefix + "-m-" + std::to_string(i), 64, emptyManifest);
+            EXPECT_LE(cache.Stats().UsedBytes, cache.Stats().MaxBytes);
+        }
+    }
+    {
+        TSnapshotMetadataCache cache({}, TSnapshotMetadataCacheOptions{.MaxBytes = 4096, .MaxRoots = 2});
+        for (size_t step = 1; step <= 4; ++step) {
+            TScopedCacheAllocInjector fail(step);
+            EXPECT_THROW(cache.PutRoot(longPrefix + "-r", 0, r1), std::bad_alloc);
+            EXPECT_EQ(cache.Stats().UsedBytes, 0U);
+            EXPECT_EQ(cache.Stats().RootEntries, 0U);
+        }
+        cache.PutRoot(longPrefix + "-r-0", 0, r1);
+        const uint64_t used = cache.Stats().UsedBytes;
+        for (size_t step = 1; step <= 4; ++step) {
+            TScopedCacheAllocInjector fail(step);
+            EXPECT_THROW(cache.PutRoot(longPrefix + "-r-0", 0, r2), std::bad_alloc);
+            EXPECT_EQ(cache.Stats().UsedBytes, used);
+            EXPECT_EQ(cache.FindRoot(longPrefix + "-r-0", 0), r1);
+        }
+        for (int i = 1; i < 8; ++i) {
+            cache.PutRoot(longPrefix + "-r-" + std::to_string(i), 0, r2);
+            EXPECT_LE(cache.Stats().UsedBytes, cache.Stats().MaxBytes);
+        }
+    }
+    {
+        TSnapshotMetadataCache cache({}, TSnapshotMetadataCacheOptions{.MaxBytes = 4096, .MaxFooters = 2});
+        for (size_t step = 1; step <= 4; ++step) {
+            TScopedCacheAllocInjector fail(step);
+            EXPECT_THROW(cache.PutFooter(longPrefix + "-f.parquet", 256, 1, footer), std::bad_alloc);
+            EXPECT_EQ(cache.Stats().UsedBytes, 0U);
+            EXPECT_EQ(cache.Stats().FooterEntries, 0U);
+        }
+        for (int i = 0; i < 8; ++i) {
+            cache.PutFooter(longPrefix + "-f-" + std::to_string(i) + ".parquet", 256, 1, footer);
+            EXPECT_LE(cache.Stats().UsedBytes, cache.Stats().MaxBytes);
+        }
+    }
+
+    // 3. Find*, EvictRoot, Stats, and Clear perform ZERO cache allocations even with 600-char keys!
+    {
+        TSnapshotMetadataCache cache({}, TSnapshotMetadataCacheOptions{.MaxBytes = 64ULL << 10});
+        const std::string rootKey = longPrefix + "-root";
+        const std::string mlKey = longPrefix + "-ml";
+        const std::string mKey = longPrefix + "-manifest";
+        const std::string fKey = longPrefix + "-footer.parquet";
+        const std::string missKey = longPrefix + "-missing";
+
+        cache.PutRoot(rootKey, 128, r1);
+        cache.PutManifestList(mlKey, emptyMl);
+        cache.PutManifest(mKey, 64, emptyManifest);
+        cache.PutFooter(fKey, 256, 1, footer);
+
+        TScopedCacheAllocInjector failAll(/*failOnCall=*/0, /*failAll=*/true);
+        EXPECT_EQ(cache.FindRoot(rootKey, 128), r1);
+        EXPECT_EQ(cache.FindRoot(missKey, 128), nullptr);
+        EXPECT_EQ(cache.FindManifestList(mlKey), emptyMl);
+        EXPECT_EQ(cache.FindManifestList(missKey), nullptr);
+        EXPECT_EQ(cache.FindManifest(mKey, 64), emptyManifest);
+        EXPECT_EQ(cache.FindManifest(missKey, 64), nullptr);
+        EXPECT_EQ(cache.FindFooter(fKey, 256, 1), footer);
+        EXPECT_EQ(cache.FindFooter(missKey, 256, 1), nullptr);
+        cache.EvictRoot(rootKey);
+        EXPECT_EQ(cache.FindRoot(rootKey, 128), nullptr);
+        EXPECT_GT(cache.Stats().UsedBytes, 0U);
+        cache.Clear();
+        EXPECT_EQ(cache.Stats().UsedBytes, 0U);
+        EXPECT_EQ(TScopedCacheAllocInjector::AllocationCount(), 0U);
+    }
+}
+
 } // namespace
 } // namespace glamdb::detail
 
